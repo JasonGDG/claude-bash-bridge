@@ -1,0 +1,14 @@
+{
+  "name": "bash-bridge",
+  "displayName": "Bash Bridge",
+  "version": "0.1.0",
+  "description": "When Claude edits files through Bash (sed, heredocs, scripts), run your Write/Edit hooks, load the path-scoped rules and nested CLAUDE.md files for those files, and keep an undo log (/bash-undo).",
+  "author": {
+    "name": "JasonGDG",
+    "url": "https://github.com/JasonGDG"
+  },
+  "homepage": "https://github.com/JasonGDG/claude-bash-bridge",
+  "repository": "https://github.com/JasonGDG/claude-bash-bridge",
+  "license": "MIT",
+  "keywords": ["hooks", "bash", "auto-mode", "rules", "undo", "rewind"]
+}

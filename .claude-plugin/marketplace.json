@@ -1,0 +1,19 @@
+{
+  "name": "claude-bash-bridge",
+  "owner": {
+    "name": "JasonGDG",
+    "url": "https://github.com/JasonGDG"
+  },
+  "metadata": {
+    "description": "bash-bridge: hooks, rules and undo for file changes Claude makes through Bash"
+  },
+  "plugins": [
+    {
+      "name": "bash-bridge",
+      "source": "./",
+      "description": "Run Write/Edit hooks, path-scoped rules and nested CLAUDE.md for files changed through Bash, plus /bash-undo.",
+      "version": "0.1.0",
+      "license": "MIT"
+    }
+  ]
+}

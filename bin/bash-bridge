@@ -1,0 +1,27 @@
+#!/bin/sh
+# bash-bridge launcher. Finds a Python 3 (3.8+) and runs the package in ../lib.
+# In hook mode it must never break the session: it always exits 0, even without Python.
+case "$0" in */*) here=${0%/*} ;; *) here=. ;; esac
+here=$(CDPATH= cd -- "$here" && pwd -P)
+root=${here%/*}
+py=""
+for cand in "${BASH_BRIDGE_PYTHON:-}" python3 /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+  [ -n "$cand" ] || continue
+  if command -v "$cand" >/dev/null 2>&1; then py=$cand; break; fi
+done
+code='
+import sys
+sys.path.insert(0, sys.argv.pop(1))
+from bashbridge.cli import main
+sys.exit(main(sys.argv[1:]))
+'
+if [ "$1" = "hook" ]; then
+  if [ -z "$py" ]; then cat >/dev/null 2>&1; exit 0; fi
+  PYTHONDONTWRITEBYTECODE=1 "$py" -I -c "$code" "$root/lib" "$@" 2>/dev/null
+  exit 0
+fi
+if [ -z "$py" ]; then
+  echo "bash-bridge: python3 not found" >&2
+  exit 1
+fi
+PYTHONDONTWRITEBYTECODE=1 exec "$py" -I -c "$code" "$root/lib" "$@"
