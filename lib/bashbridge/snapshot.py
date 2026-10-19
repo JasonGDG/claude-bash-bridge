@@ -149,9 +149,10 @@ def store_dir_for(worktree: str) -> str:
     return os.path.join(state_dir(), "projects", project_key(worktree))
 
 
-def pid_alive(pid) -> bool:
-    """False only when pid names a process that certainly no longer exists."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+def pid_alive(pid, start=None) -> bool:
+    """False only when the process that wrote an entry certainly no longer exists: its pid is gone,
+    or the pid now belongs to a process with another start time (reused). Unknown identity -> True."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or not isinstance(start, str):
         return True
     try:
         os.kill(pid, 0)
@@ -159,7 +160,11 @@ def pid_alive(pid) -> bool:
         return False
     except OSError:
         return True
-    return True
+    from .bridge import proc_identity
+    ident = proc_identity(pid)
+    if ident is None:
+        return True
+    return ident[0] == start
 
 
 class Store:
@@ -606,6 +611,11 @@ class Store:
             p = os.path.join(self.pending_dir, name)
             if name == mine or not name.endswith(".json"):
                 continue
+            try:
+                check_private_file(p)
+            except UnsafeState as e:
+                debug("skipping pending %s: %s" % (name, e))
+                continue
             data = read_json(p, None)
             ts = data.get("ts") if isinstance(data, dict) else None
             age = now - ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None
@@ -639,7 +649,7 @@ class Store:
                 continue
             if now - float(data["ts"]) > max_age_s:
                 continue
-            if not pid_alive(data.get("pid")):
+            if not pid_alive(data.get("pid"), data.get("pid_start")):
                 self._drop(p, "pending of an exited Claude Code process")
                 continue
             res.append(p)
@@ -650,6 +660,10 @@ class Store:
         n = 0
         for tuid in ids:
             path = self.pending_path(tuid)
+            try:
+                check_private_file(path)
+            except UnsafeState:
+                continue
             data = read_json(path, None)
             if isinstance(data, dict) and data.get("session") == session and data.get("tuid") == tuid:
                 self._drop(path, "pending of resolved call %s" % tuid)

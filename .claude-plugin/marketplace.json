@@ -12,7 +12,7 @@
       "name": "bash-bridge",
       "source": "./",
       "description": "Run Write/Edit hooks, path-scoped rules and nested CLAUDE.md for files changed through Bash, plus /bash-undo.",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "license": "MIT"
     }
   ]

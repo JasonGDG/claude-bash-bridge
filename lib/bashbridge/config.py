@@ -62,11 +62,13 @@ DEFAULTS = {
 # snapshot budget would make a project "too big" and turn everything off) ...
 USER_ONLY = {"project_hooks", "sources", "plugin_dirs", "include_match_all", "follow_rule_symlinks", "excludes",
              "hooks", "guard", "rules", "undo", "disable_hours", "max_untracked", "max_file_bytes", "max_files",
-             "first_snapshot_ms", "snapshot_ms", "scan_ms", "max_bridged_files"}
-# ... nor raise its resource limits. It may lower these, down to PROJECT_FLOOR. "enabled": false is
-# allowed (a repository may opt out of bash-bridge as a whole), but the user and Claude are told.
-LOWER_ONLY = {"undo_max_bytes", "store_max_bytes", "keep_entries", "undo_days", "hook_timeout_s", "hook_budget_s",
-              "context_chars", "rule_chars", "hook_workers"}
+             "first_snapshot_ms", "snapshot_ms", "scan_ms", "max_bridged_files",
+             # hook deadlines (a short one makes guards time out) and undo retention
+             "hook_timeout_s", "hook_budget_s", "undo_max_bytes", "store_max_bytes", "keep_entries", "undo_days"}
+# A project may only lower concurrency and output sizes, down to PROJECT_FLOOR. "enabled": false is
+# allowed (a repository may opt out of bash-bridge as a whole). Both, and every ignored key, are
+# announced to the user and Claude once per session.
+LOWER_ONLY = {"context_chars", "rule_chars", "hook_workers"}
 
 MB = 1024 * 1024
 # (type, min, max) for every number; values outside are replaced by the default (debug note)
@@ -89,9 +91,7 @@ RANGES = {
     "undo_max_bytes": (int, 0, 1 << 40),
     "store_max_bytes": (int, 0, 1 << 42),
 }
-PROJECT_FLOOR = {"hook_timeout_s": 10, "hook_budget_s": 30, "keep_entries": 10, "undo_days": 1,
-                 "undo_max_bytes": 10 * MB, "store_max_bytes": 100 * MB, "context_chars": 2000, "rule_chars": 500,
-                 "hook_workers": 1}
+PROJECT_FLOOR = {"context_chars": 2000, "rule_chars": 500, "hook_workers": 1}
 BOOLS = {"enabled", "hooks", "rules", "undo", "include_match_all", "follow_rule_symlinks"}
 ENUMS = {"guard": ("revert", "report", "off"), "rules_on_read": ("auto", "all", "off")}
 KNOWN_SOURCES = ("managed", "user", "project", "local", "plugins")
@@ -182,10 +182,12 @@ def load(project_dir: str | None) -> dict:
                 continue
             if i > 0 and k in USER_ONLY:
                 debug("project config may not set %s" % k)
+                cfg.setdefault("project_ignored", []).append(k)
                 continue
             if i > 0 and k in LOWER_ONLY:
                 if v > cfg[k]:
                     debug("project config may only lower %s" % k)
+                    cfg.setdefault("project_ignored", []).append(k)
                     continue
                 if v < PROJECT_FLOOR.get(k, 0):
                     debug("project config may not lower %s below %s" % (k, PROJECT_FLOOR[k]))

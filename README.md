@@ -50,7 +50,7 @@ PostToolUse(Bash)  -> snapshot again, diff: created / modified / deleted
 
 ### Unit and integration tests
 
-`test/run.sh` simulates Claude Code calling the hooks around real shell commands. The suite has 174 tests. All pass on Python 3.14 and on macOS's `/usr/bin/python3` 3.9. `test/test_livetest.py` reproduces the bugs a live stress test found (34 real `claude -p` sessions):
+`test/run.sh` simulates Claude Code calling the hooks around real shell commands. The suite has 179 tests. All pass on Python 3.14 and on macOS's `/usr/bin/python3` 3.9. `test/test_livetest.py` reproduces the bugs a live stress test found (34 real `claude -p` sessions):
 * a call denied by a permission rule (its PreToolUse ran, its PostToolUse never came) is cleared through PermissionDenied, PostToolBatch and the transcript, so it can't switch the guard off;
 * the classifier treats `sed -Ei`/`-ni`/`-ri`, `git stash`, `tree -o`, `xxd in out` and `rg --pre` as writers;
 * the Bash command is no longer in synthesized events;
@@ -188,8 +188,9 @@ Undo restores modified files with their content and mode, recreates deleted file
 
 `~/.claude/bash-bridge.json`, or `<project>/.claude/bash-bridge.json`, which takes precedence where it may. A cloned repository can't widen what bash-bridge runs, reads or stores, and can't switch its protection off piece by piece:
 
-* A project file can't set `hooks`, `guard`, `rules`, `undo`, `project_hooks`, `sources`, `plugin_dirs`, `include_match_all`, `follow_rule_symlinks`, `excludes`, `disable_hours`, `max_untracked`, `max_files`, `max_file_bytes`, `max_bridged_files` or the snapshot budgets (`first_snapshot_ms`, `snapshot_ms`, `scan_ms`). Lower values there would make the project look "too big" or skip files.
-* It can lower, never raise, `undo_max_bytes`, `store_max_bytes`, `keep_entries`, `undo_days`, `hook_timeout_s`, `hook_budget_s`, `hook_workers`, `context_chars` and `rule_chars`, and not below a floor (for example `hook_timeout_s` 10, `keep_entries` 10, `undo_days` 1).
+* A project file can't set `hooks`, `guard`, `rules`, `undo`, `project_hooks`, `sources`, `plugin_dirs`, `include_match_all`, `follow_rule_symlinks`, `excludes`, `disable_hours`, `max_untracked`, `max_files`, `max_file_bytes`, `max_bridged_files`, the snapshot budgets (`first_snapshot_ms`, `snapshot_ms`, `scan_ms`), the hook deadlines (`hook_timeout_s`, `hook_budget_s`) or undo retention (`keep_entries`, `undo_days`, `undo_max_bytes`, `store_max_bytes`). Lower values there would make the project look "too big", skip files, let guards time out or drop undo data early.
+* It can only lower `hook_workers`, `context_chars` and `rule_chars` (concurrency and output size), not below a floor.
+* A key it may not set is ignored, and the first Bash call of each session tells you and Claude which keys were ignored.
 * It can turn bash-bridge off completely with `"enabled": false`. Then the first Bash call of each session tells you and Claude: "bash-bridge is disabled by …/.claude/bash-bridge.json". The same goes for `BASH_BRIDGE_DISABLE` set in the project's settings `env`.
 * Every value is checked for type and range (numbers as numbers or numeric strings). An invalid value is replaced by the default, with a line in the debug log.
 
@@ -218,7 +219,7 @@ Undo restores modified files with their content and mode, recreates deleted file
 }
 ```
 
-* `hook_budget_s` is one deadline for all bridged hooks of a Bash call (at most 200, so snapshots and the undo log still fit in the post hook's 300 s). No hook starts after it, and running ones are stopped at it; you get a note naming the skipped hooks.
+* `hook_budget_s` is one deadline for all bridged hooks of a Bash call. It covers the hooks only: snapshots, lock waits, rollback and the undo log have their own timeouts, which together fit in the remaining 100 s (at most 200 of the post hook's 300 s). No hook starts after it, and running ones are stopped at it; you get a note naming the skipped hooks.
 * `hook_workers` (1 to 16): files whose hooks run at the same time.
 * `disable_hours`: a project that is too big or too slow (see Limits) is skipped for 10 minutes and then measured again. A value above 0 skips it for that many hours instead.
 * `guard`: `"revert"` rolls back a change your PreToolUse Write/Edit hook denies; `"report"` only tells Claude; `"off"` skips it.
@@ -252,7 +253,7 @@ Every `BASH_BRIDGE_*` variable, plus `CLAUDE_CONFIG_DIR`, is ignored when the pr
   * `PermissionDenied`, which Claude Code fires only for auto mode denials;
   * the transcript: each JSONL record of the last 4 MB (at most 20,000 records, the cut first record dropped) is parsed, and a call counts as denied only if its `tool_result` record carries Claude Code's own `toolDenialKind` marker (`permission-rule`, `user-rejected`, `automode-blocked`, `automode-unavailable`) with `is_error`. Text a command prints can't fake that. A result older than that window, or inside a single line over 4 MB, is not seen; the call then keeps counting as in flight, which only means no rollback.
   
-  Otherwise a registered call stops counting after 120 s, or as soon as the Claude Code process that started it has exited. Registrations older than an hour, dated in the future (clock jump) or beyond 200 are deleted on every pre and post hook.
+  A `tool_use_id` with more than one result record counts as unknown, never as denied. Otherwise a registered call stops counting after 120 s, or earlier when the Claude Code process that started it has exited: the entry stores that process's pid and start time (`ps -o lstart=`), and a pid that is gone or now has another start time means exited. When the identity is unknown (the hook's parent is a shell, or `ps` failed), the entry simply counts for the 120 s. Registrations older than an hour, dated in the future (clock jump) or beyond 200 are deleted on every pre and post hook.
 * **Command hooks only.** `http`, `mcp_tool`, `prompt` and `agent` hooks, hooks from skill or agent frontmatter, and PowerShell hooks are not bridged. Plugins loaded with `--plugin-dir` are invisible unless you list them in `BASH_BRIDGE_PLUGIN_DIRS`. Runtime choices are invisible to a hook: `--setting-sources`, `--settings '{"disableAllHooks": true}'`. So bash-bridge can run a hook that Claude Code disabled for that one process; mirror such flags with `BASH_BRIDGE_SOURCES` / `BASH_BRIDGE_DISABLE`. This is a known limit until Claude Code tells hooks which sources are active.
 * **Rules arrive one step late:** after the Bash write, not before. Claude then fixes the file, which is what the end-to-end runs show. The glob matcher mirrors Claude Code's documented syntax but isn't its code. For nested `.claude/rules`, globs are relative to the folder that contains the `.claude` folder; that's an assumption.
 * **Synthesized `Edit` payloads** carry the changed line range, not Claude's exact `old_string`. Hooks that rebuild a patch from it see a line-level diff.
@@ -260,11 +261,14 @@ Every `BASH_BRIDGE_*` variable, plus `CLAUDE_CONFIG_DIR`, is ignored when the pr
 * **Case-only renames** (`mv Readme.txt README.txt`) on a case-insensitive file system (the macOS default) are not seen: git reports no change.
 * **Undo covers Bash changes only.** Edit/Write changes are still for `/rewind`. Undo does not depend on git objects. The previous content of every changed file is copied into `blobs/` (zlib, `0600`, at most 200 MB per call) and deleted together with its entry. An entry is dropped after 30 days or when the log grows past 300 calls. Entries whose content is no longer stored show as `[expired]` in `list` and as `EXPIRED` in `undo`, and nothing is touched for them. Old snapshot trees in the shadow repo are pruned by a background `git gc` (14 days, at most every 3 days); detection only needs the current trees.
 * **Guard rollback is conservative.** A denied file is rolled back only if it still holds exactly what the Bash command wrote and no other call overlapped. Undo checks each file again, under the lock, right before writing it. Both work relative to opened directory descriptors (`O_NOFOLLOW` per path component, then temp file plus `rename` inside that directory). A symlink swapped into the path can't redirect them out of the project. Programs outside bash-bridge don't take its lock, though: a write that lands in the microseconds between the last check and the `rename` is overwritten.
+* **Hook concurrency** is `hook_workers` files at a time, and each file's matching hooks run at once, so up to `hook_workers` x (hooks per file) processes.
 * **Pre-image storage is bounded.** Sizes are checked before content is read, copying streams in 1 MB chunks, at most 200 MB is kept per call, and at most 1 GB (`store_max_bytes`) per project, with the oldest entries expiring first. Files above a cap are listed as `[expired]` rather than half-saved.
 
 ## Security
 
-bash-bridge executes hook commands. That makes it a security boundary, so it is stricter than "whatever is in the files":
+bash-bridge executes hook commands. That makes it a security boundary, so it is stricter than "whatever is in the files".
+
+**Threat model.** bash-bridge protects against mistakes (a wrong `sed`, a Bash route around your Write/Edit guards) and against untrusted repository content (settings, config, rules, git config in a clone). It does not protect against a deliberately adversarial model: a Bash command can already change any file the model can write, including the session transcript bash-bridge reads to see denied calls, its state folder, or your settings. Anything that can write the transcript file is out of scope.
 
 * Hooks from `.claude/settings.json` and `.claude/settings.local.json` are code from the repository. They run only if one of these holds:
   * Claude Code has recorded the workspace trust dialog as accepted for the project or a parent folder (`hasTrustDialogAccepted`). The file read is the account's real `~/.claude.json`, from the password database rather than `$HOME`, and `$CLAUDE_CONFIG_DIR/.claude.json` only when the project didn't set that variable and it doesn't point into the project. As in Claude Code, a trusted parent folder covers everything below it: trusting `$HOME` trusts every repository you clone under it.
@@ -273,6 +277,7 @@ bash-bridge executes hook commands. That makes it a security boundary, so it is 
   `claude -p` skips the trust dialog, so throwaway folders used with `-p` need that opt-in. A repository can't opt itself in, through its `bash-bridge.json` or through its settings `env`. Plugins enabled only in an untrusted project's settings are ignored too.
 * `disableAllHooks` (any level; managed = everything) and `allowManagedHooksOnly` are honoured. Runtime flags are not visible to hooks, see Limits.
 * Bridged hooks inherit the full Claude Code environment, as native hooks do, plus `BASH_BRIDGE_ACTIVE=1`, `CLAUDE_PROJECT_DIR` and the plugin variables. There is no allowlist. A hook that Claude Code would have skipped because of a runtime flag (see Limits) therefore runs with your credentials in its environment.
+* Environment variables a repository exports through direnv (`.envrc`, once you `direnv allow` it) look exactly like your own environment, so they can set `BASH_BRIDGE_GUARD=off` or `BASH_BRIDGE_PROJECT_HOOKS=1`. Don't `direnv allow` repositories you don't trust.
 * The undo store holds old file contents, which can include secrets you deleted. It is private (`0700`/`0600`), owner-checked and never a symlink. Deleting `~/.claude-bash-bridge` clears it.
 * Rule files reached through symlinks that leave `.claude/rules` are not injected unless you allow it.
 

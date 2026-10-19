@@ -26,12 +26,12 @@ READERS = {
 GIT_READ = {
     "status", "log", "diff", "show", "blame", "rev-parse", "ls-files", "ls-tree", "cat-file", "describe",
     "grep", "shortlog", "whatchanged", "merge-base", "rev-list", "show-ref", "for-each-ref",
-    "check-ignore", "version", "help", "count-objects", "name-rev", "cherry", "var",
+    "check-ignore", "version", "count-objects", "name-rev", "cherry", "var",
 }
 
 # git options and env that make a "reading" subcommand run other programs (diff drivers, textconv,
 # gpg, a pager) or read another repository's config
-GIT_GLOBAL_WRITE = {"-c", "--config-env", "--exec-path", "--git-dir", "--work-tree", "--namespace", "-p", "--paginate"}
+GIT_GLOBAL_WRITE = {"-c", "--config-env", "--exec-path", "--git-dir", "--work-tree", "--namespace", "-p", "--paginate", "-P"}
 GIT_ARG_WRITE = {"--ext-diff", "--textconv", "--show-signature", "--filters", "-O", "--open-files-in-pager",
                  "--output", "-o"}
 # repository config that lets git diff/log/show/blame/status/... run a program (checked per command)
@@ -135,6 +135,9 @@ def _reader_ok(words, git_dirs=None, cur=None) -> bool:
         if any(a in GIT_ARG_WRITE or a.split("=")[0] in GIT_ARG_WRITE for a in rest):
             return False
         if sub == "grep" and any(re.match(r"^-[A-Za-z]*O", a) for a in rest):
+            return False
+        # signature placeholders (%G?, %GS, %GK ...) in --format/--pretty make git run gpg
+        if any("%G" in a for a in rest):
             return False
         if git_dirs is not None:
             git_dirs.add(where)

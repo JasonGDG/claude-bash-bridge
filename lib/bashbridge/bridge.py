@@ -192,6 +192,7 @@ def transcript_results(path, tail_bytes=TRANSCRIPT_TAIL, max_records=TRANSCRIPT_
         lines = lines[1:]  # partial first record
     lines = lines[:-1]  # empty after the last newline, or a record still being written
     res = {}
+    seen = set()
     for line in lines[-max_records:]:
         if b"tool_result" not in line:
             continue
@@ -214,7 +215,10 @@ def transcript_results(path, tail_bytes=TRANSCRIPT_TAIL, max_records=TRANSCRIPT_
                 status = "denied"
             else:
                 status = "done"
-            res[b["tool_use_id"]] = status
+            tid = b["tool_use_id"]
+            # an id with more than one result record is ambiguous: never read it as a denial
+            res[tid] = "unknown" if tid in seen else status
+            seen.add(tid)
     _TRANSCRIPT_CACHE.clear()
     _TRANSCRIPT_CACHE[key] = res
     return res
@@ -246,32 +250,36 @@ def _prune_finished(store, event, own):
 _SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "fish", "busybox"}
 
 
+def proc_identity(pid):
+    """(start time, command name) of a running process from `ps`, or None."""
+    import subprocess
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=,comm=", "-p", str(int(pid))], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=2,
+                             env=dict(os.environ, LC_ALL="C")).stdout.decode("utf-8", "replace").strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    parts = out.split()
+    if len(parts) < 6:
+        return None
+    return " ".join(parts[:5]), os.path.basename(" ".join(parts[5:]).lstrip("-"))
+
+
 def _claude_pid(sid):
-    """pid of the Claude Code process that runs this hook, or None if unsure. The launcher passes
-    its parent's pid; it only counts when that is not a shell (a shell would be gone right after
-    the hook). Checked with `ps` once per session and pid."""
+    """(pid, start time) of the Claude Code process running this hook, or (None, None) when its
+    identity is unknown. The launcher passes its parent's pid; a shell parent (gone right after the
+    hook) or a failed `ps` gives "unknown": such an entry then counts as running for 120 s, as any
+    entry does, but can't be dropped early as exited."""
     try:
         pid = int(os.environ.get("BASH_BRIDGE_HOOK_PPID") or 0)
     except ValueError:
-        return None
+        return None, None
     if pid <= 1:
-        return None
-    sess = load_session(sid)
-    if sess.get("claude_pid") == pid:
-        return pid
-    if sess.get("not_claude_pid") == pid:
-        return None
-    import subprocess
-    try:
-        comm = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL, timeout=2).stdout.decode("utf-8", "replace").strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    name = os.path.basename(comm.lstrip("-"))
-    ok = bool(name) and name not in _SHELLS
-    sess["claude_pid" if ok else "not_claude_pid"] = pid
-    save_session(sid, sess)
-    return pid if ok else None
+        return None, None
+    ident = proc_identity(pid)
+    if not ident or not ident[1] or ident[1] in _SHELLS:
+        return None, None
+    return pid, ident[0]
 
 
 def handle_pre(event, cfg):
@@ -289,7 +297,8 @@ def handle_pre(event, cfg):
     sid, agent = _caller(event)
     base = {"ts": time.time(), "project_dir": project_dir, "session": sid, "agent": agent, "tuid": tuid,
             "transcript": event.get("transcript_path") if isinstance(event.get("transcript_path"), str) else None,
-            "pid": _claude_pid(sid)}
+            "pid": None, "pid_start": None}
+    base["pid"], base["pid_start"] = _claude_pid(sid)
     t0 = time.time()
     try:
         with store.lock(timeout=5.0):
@@ -838,6 +847,21 @@ def dispatch(mode, event):
                 return {"systemMessage": msg, "hookSpecificOutput": {"hookEventName": ev, "additionalContext": msg}}
         return None
     secure_state()  # raises on a symlinked / foreign state dir: then bash-bridge does nothing
+    out = _dispatch(mode, event, cfg)
+    ignored = sorted(set(cfg.get("project_ignored") or []))
+    if ignored and mode in ("post", "post-failure"):
+        sid = event.get("session_id") or "nosession"
+        if _once(sid, "project-ignored:" + ",".join(ignored)):
+            msg = ("bash-bridge ignored %s in the project's .claude/bash-bridge.json: a repository may not "
+                   "change these (only hook_workers, context_chars and rule_chars, and only lower)."
+                   % ", ".join(ignored))
+            ev = "PostToolUseFailure" if mode == "post-failure" else "PostToolUse"
+            out = _merge([{"systemMessage": msg, "hookSpecificOutput": {"hookEventName": ev,
+                                                                         "additionalContext": msg}}], out)
+    return out
+
+
+def _dispatch(mode, event, cfg):
     if mode == "pre":
         return handle_pre(event, cfg)
     if mode == "post":

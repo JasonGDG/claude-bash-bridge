@@ -150,6 +150,23 @@ class R3ProjectConfigCannotWeaken(GuardCase):
         out = self.bash("echo hacked >> protected.txt")
         self.assertIn("restored", out["reason"])
 
+    def test_deadlines_and_retention_are_user_only_with_a_note(self):
+        """0.3.1 (B1): a project can't shorten hook deadlines or undo retention; it is told so, once."""
+        self.project_cfg({"hook_timeout_s": 10, "hook_budget_s": 30, "keep_entries": 10, "undo_days": 1,
+                          "undo_max_bytes": 10485760, "store_max_bytes": 104857600, "hook_workers": 2})
+        cfg = self.load()
+        from bashbridge.config import DEFAULTS
+        for k in ("hook_timeout_s", "hook_budget_s", "keep_entries", "undo_days", "undo_max_bytes", "store_max_bytes"):
+            self.assertEqual(cfg[k], DEFAULTS[k], k)
+        self.assertEqual(cfg["hook_workers"], 2, "concurrency may be lowered")
+        out = self.bash("echo hacked >> protected.txt")
+        self.assertIn("restored", out["reason"])
+        self.assertIn("ignored", out["systemMessage"])
+        self.assertIn("hook_timeout_s", self.context(out))
+        self.assertNotIn("hook_workers", out["systemMessage"].split("only")[0])
+        out = self.bash("echo again >> protected.txt")
+        self.assertNotIn("ignored", out.get("systemMessage", ""), "once per session")
+
     def test_project_may_disable_but_it_is_visible(self):
         self.project_cfg({"enabled": False})
         out = self.bash("echo hacked >> protected.txt")
@@ -203,14 +220,15 @@ class R5R8PendingLifetime(GuardCase):
         import subprocess
         p = subprocess.Popen(["true"])
         p.wait()
-        path = self.fake_pending("toolu_dead", pid=p.pid)
+        path = self.fake_pending("toolu_dead", pid=p.pid, pid_start="Mon Jan  1 00:00:00 2024")
         out = self.bash("echo hacked >> protected.txt")
         self.assertIn("restored", out["reason"])
         self.assertFalse(os.path.exists(path))
 
     def test_live_other_session_counts(self):
         self.bash("echo warm > w.txt")
-        self.fake_pending("toolu_live", pid=os.getpid())
+        from bashbridge.bridge import proc_identity
+        self.fake_pending("toolu_live", pid=os.getpid(), pid_start=proc_identity(os.getpid())[0])
         out = self.bash("echo hacked >> protected.txt")
         self.assertIn("at the same time", out["reason"])
 
@@ -229,6 +247,32 @@ class R5R8PendingLifetime(GuardCase):
         os.utime(p, None)  # rewritten just now (mark_overlap does that)
         out = self.bash("echo hacked >> protected.txt")
         self.assertIn("restored", out["reason"])
+
+    def test_reused_pid_does_not_count(self):
+        """0.3.1: the start time must match too, or the pid belongs to another process now."""
+        self.bash("echo warm > w.txt")
+        path = self.fake_pending("toolu_reused", pid=os.getpid(), pid_start="Mon Jan  1 00:00:00 2024")
+        out = self.bash("echo hacked >> protected.txt")
+        self.assertIn("restored", out["reason"])
+        self.assertFalse(os.path.exists(path))
+
+    def test_unknown_identity_counts_for_the_window(self):
+        self.bash("echo warm > w.txt")
+        self.fake_pending("toolu_unknown", pid=None, pid_start=None)
+        out = self.bash("echo hacked >> protected.txt")
+        self.assertIn("at the same time", out["reason"])
+
+    def test_pending_entries_are_checked_before_reading(self):
+        """0.3.1 (R6): files listed from pending/ go through check_private_file (no symlinks)."""
+        self.bash("echo warm > w.txt")
+        target = os.path.join(self.tmp, "elsewhere.json")
+        with open(target, "w") as fh:
+            json.dump({"ts": time.time(), "session": "x", "tuid": "toolu_link", "tree": "x"}, fh)
+        link = os.path.join(state_store(self), "pending", "toolu_link.json")
+        os.symlink(target, link)
+        out = self.bash("echo hacked >> protected.txt")
+        self.assertIn("restored", out["reason"], "a symlinked entry is not trusted as a running call")
+        self.assertTrue(os.path.exists(target))
 
     def test_count_is_capped(self):
         self.bash("echo warm > w.txt")
@@ -287,6 +331,14 @@ class R7TranscriptParsing(BridgeCase):
         self.assertEqual(len(res), 10)
         self.assertIn("toolu_29", res)
 
+    def test_duplicate_ids_are_unknown(self):
+        """0.3.1 (B2): an id with two result records is ambiguous, in either order."""
+        self.add(denied_record("toolu_a"))
+        self.add(ran_record("toolu_a", "x"))
+        self.add(ran_record("toolu_b", "x"))
+        self.add(denied_record("toolu_b"))
+        self.assertEqual(self.results(), {"toolu_a": "unknown", "toolu_b": "unknown"})
+
     def test_multi_result_record_is_never_a_denial(self):
         rec = denied_record("toolu_a")
         rec["message"]["content"].append(dict(rec["message"]["content"][0], tool_use_id="toolu_b"))
@@ -318,7 +370,9 @@ class R9R10Classifier(BridgeCase):
     def test_git_flags_and_env_that_run_programs(self):
         for cmd in ("git diff --ext-diff", "git log --show-signature", "git -c diff.external=x diff",
                     "GIT_EXTERNAL_DIFF=./x git diff", "git grep -O foo", "git cat-file --textconv HEAD:a",
-                    "PAGER=./x git log", "git --git-dir=/tmp/x log", "LESSOPEN='|./x %s' cat a"):
+                    "PAGER=./x git log", "git --git-dir=/tmp/x log", "LESSOPEN='|./x %s' cat a",
+                    "git help log", "git log --format=%G?", "git log --pretty='format:%h %GS'",
+                    "git -P log", "git --paginate log"):
             self.assertFalse(self.ro(cmd), cmd)
         self.assertTrue(self.ro("LC_ALL=C grep x a.txt"))
 
