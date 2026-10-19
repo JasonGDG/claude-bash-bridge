@@ -215,7 +215,11 @@ def handle_post(event, cfg, failure=False):
 
     def synth(st, rel):
         if rel not in synth_cache:
-            synth_cache[rel] = synthesize(store, pre_tree, st, rel, abs_of(rel))
+            try:
+                synth_cache[rel] = synthesize(store, pre_tree, st, rel, abs_of(rel))
+            except Exception as e:  # noqa: BLE001 - one odd file must not cost the others
+                debug("synthesize %s failed: %s" % (rel, e))
+                synth_cache[rel] = None
         return synth_cache[rel]
 
     budget_end = time.time() + float(cfg["hook_budget_s"])
@@ -225,6 +229,8 @@ def handle_post(event, cfg, failure=False):
         pre_handlers = collect("PreToolUse", project_dir, cfg)
         if pre_handlers:
             for st, rel in live:
+                if synth(st, rel) is None:
+                    continue
                 tool, tinput, _tr, word = synth(st, rel)
                 hs = [h for h in select_for_tool(pre_handlers, tool, cfg)
                       if if_matches(h.spec.get("if"), tool, abs_of(rel), event.get("cwd") or project_dir)]
@@ -252,7 +258,7 @@ def handle_post(event, cfg, failure=False):
                             else:
                                 write_blob_to(store, pre_tree, rel)
                             reverted.add(rel)
-                        except OSError as e:
+                        except Exception as e:  # noqa: BLE001
                             debug("revert %s failed: %s" % (rel, e))
             for st, rel, tool, label, reason in denied:
                 action = ("bash-bridge restored the file to its state before the Bash command"
@@ -264,7 +270,7 @@ def handle_post(event, cfg, failure=False):
         post_handlers = collect("PostToolUse", project_dir, cfg)
         if post_handlers:
             for st, rel in live:
-                if rel in reverted:
+                if rel in reverted or synth(st, rel) is None:
                     continue
                 tool, tinput, tresp, word = synth(st, rel)
                 hs = [h for h in select_for_tool(post_handlers, tool, cfg)
@@ -416,6 +422,35 @@ def _maintenance():
                     fp = os.path.join(pend, f)
                     if time.time() - os.path.getmtime(fp) > 86400:
                         os.remove(fp)
+            _maybe_gc(os.path.join(proj, name))
+    except OSError:
+        pass
+
+
+GC_EVERY_S = 3 * 86400
+GC_PRUNE = "14.days.ago"
+
+
+def _maybe_gc(store_dir):
+    """Old snapshot trees are unreferenced objects; prune them in the background now and then."""
+    gitdir = os.path.join(store_dir, "shadow.git")
+    stamp = os.path.join(store_dir, "last-gc")
+    if not os.path.isdir(gitdir):
+        return
+    try:
+        if time.time() - os.path.getmtime(stamp) < GC_EVERY_S:
+            return
+    except OSError:
+        pass
+    with open(stamp, "w") as fh:
+        fh.write(str(time.time()))
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_DIR"] = gitdir
+    try:
+        subprocess.Popen(["git", "gc", "--quiet", "--prune=" + GC_PRUNE], env=env, cwd=store_dir,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
     except OSError:
         pass
 

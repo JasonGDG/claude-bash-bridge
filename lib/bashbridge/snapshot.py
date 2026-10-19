@@ -512,13 +512,14 @@ def write_blob_to(store: Store, tree: str, rel: str) -> bool:
     full = os.path.join(store.worktree, rel)
     parent = os.path.dirname(full)
     if os.path.lexists(parent) and not os.path.isdir(parent):
-        os.remove(parent)
+        os.remove(parent)  # a file or symlink now sits where the directory was
     os.makedirs(parent, exist_ok=True)
-    if os.path.islink(full) or (os.path.lexists(full) and not os.path.isfile(full)):
-        if os.path.isdir(full) and not os.path.islink(full):
-            shutil.rmtree(full)
-        else:
-            os.remove(full)
+    if not _inside(parent, store.worktree):
+        raise OSError("refusing to write through a symlink that leaves the project: %s" % rel)
+    if os.path.lexists(full) and not os.path.islink(full) and os.path.isdir(full):
+        os.rmdir(full)  # only an empty directory; anything else raises and is reported
+    elif os.path.islink(full) or (os.path.lexists(full) and not os.path.isfile(full)):
+        os.remove(full)
     if mode == "120000":
         if os.path.lexists(full):
             os.remove(full)
@@ -533,17 +534,17 @@ def write_blob_to(store: Store, tree: str, rel: str) -> bool:
 
 
 def remove_path(store: Store, rel: str) -> None:
+    """Delete a file the Bash call created. Directories are left alone."""
     full = os.path.join(store.worktree, rel)
+    if not _inside(os.path.dirname(full), store.worktree):
+        raise OSError("refusing to delete through a symlink that leaves the project: %s" % rel)
     if os.path.islink(full) or os.path.isfile(full):
         os.remove(full)
-    # remove now-empty parent directories (never the work tree itself)
-    d = os.path.dirname(full)
-    while d and d != store.worktree and d.startswith(store.worktree + os.sep):
-        try:
-            os.rmdir(d)
-        except OSError:
-            break
-        d = os.path.dirname(d)
+
+
+def _inside(path: str, root: str) -> bool:
+    real, top = os.path.realpath(path), os.path.realpath(root)
+    return real == top or real.startswith(top + os.sep)
 
 
 __all__ = ["Store", "SnapshotError", "Disabled", "find_git_toplevel", "git_blob_sha", "write_blob_to",

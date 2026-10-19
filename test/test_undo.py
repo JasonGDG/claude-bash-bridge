@@ -26,9 +26,9 @@ class Undo(BridgeCase):
         self.assertEqual(self.read("keep.txt"), "keep\n")
         self.assertEqual(self.read("gone.txt"), "will be deleted\n")
         self.assertFalse(self.exists("created.txt"))
-        self.assertIn("restore", out)
-        self.assertIn("recreate", out)
-        self.assertIn("remove", out)
+        self.assertIn("restored", out)
+        self.assertIn("recreated", out)
+        self.assertIn("removed", out)
         self.assertEqual(sh("git status --porcelain", self.proj).stdout.decode(), "")
 
     def test_dry_run_changes_nothing(self):
@@ -66,7 +66,7 @@ class Undo(BridgeCase):
         self.write("keep.txt", "edited later by the Edit tool\n")
         code, out = self.undo()
         self.assertEqual(code, 2)
-        self.assertIn("SKIP", out)
+        self.assertIn("SKIPPED", out)
         self.assertEqual(self.read("keep.txt"), "edited later by the Edit tool\n")
         code, out = self.undo("--force")
         self.assertEqual(code, 0, out)
@@ -102,6 +102,32 @@ class Undo(BridgeCase):
         self.bash("echo a > keep.txt")
         self.bash("bash-bridge undo --project . || true")  # not on PATH here: still must not be recorded
         self.assertEqual(len(self.entries()), 1)
+
+    def test_gc_keeps_recent_snapshots(self):
+        import time
+        self.bash("echo gc-test > keep.txt")
+        ev = {"session_id": self.session, "hook_event_name": "SessionStart", "source": "startup", "cwd": self.proj}
+        self.assertEqual(self.run_hook("session-start", ev)[0], 0)
+        store = os.path.join(self.state, "projects", os.listdir(os.path.join(self.state, "projects"))[0])
+        self.assertTrue(os.path.exists(os.path.join(store, "last-gc")))
+        for _ in range(50):  # gc runs detached; wait until it is done
+            if not os.path.exists(os.path.join(store, "shadow.git", "gc.pid")):
+                break
+            time.sleep(0.1)
+        time.sleep(0.5)
+        code, out = self.undo()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.read("keep.txt"), "keep\n")
+
+    def test_symlink_escape_refused(self):
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        self.bash("rm keep.txt && mkdir sub && echo x > sub/f.txt")
+        # something later swaps the folder for a symlink pointing outside the project
+        sh("rm -r sub && ln -s '%s' sub" % outside, self.proj)
+        code, out = self.undo("--force")
+        self.assertEqual(os.listdir(outside), [])
+        self.assertEqual(self.read("keep.txt"), "keep\n")
 
     def test_nothing_to_undo(self):
         code, out = self.undo()

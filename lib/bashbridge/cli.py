@@ -142,37 +142,45 @@ def cmd_undo(args) -> int:
         print("bash-bridge: nothing to undo in %s" % store.worktree)
         return 1
     steps = plan_undo(store, entries, args.force)
-    head = "dry run, nothing changed" if args.dry_run else "undo"
-    print("bash-bridge %s: %d Bash call(s) in %s" % (head, len(entries), store.worktree))
-    verb = {"restore": "restore", "recreate": "recreate", "remove": "remove", "unchanged": "keep"}
+    if args.dry_run:
+        print("bash-bridge DRY RUN (nothing changed yet): undo the last %d Bash call(s) in %s"
+              % (len(entries), store.worktree))
+    else:
+        print("bash-bridge UNDO: undoing the last %d Bash call(s) in %s" % (len(entries), store.worktree))
+    past = {"restore": "restored", "recreate": "recreated", "remove": "removed", "unchanged": "kept"}
+    future = {"restore": "would restore", "recreate": "would recreate", "remove": "would remove",
+              "unchanged": "would keep"}
+    note = {"restore": "(the Bash call modified it)", "recreate": "(the Bash call deleted it)",
+            "remove": "(the Bash call created it)", "unchanged": "(already back at the old content)"}
     by_entry = {}
     for s in steps:
         by_entry.setdefault(s["entry"], []).append(s)
     failed = 0
+    done = 0
     incomplete = set()
     with store.lock(timeout=10.0):
         for e in entries:
-            print("#%s %s  %s" % (e["id"], _fmt_time(e.get("ts")), _one_line(e.get("command"))))
+            print("Bash call id %s at %s: %s" % (e["id"], _fmt_time(e.get("ts")), _one_line(e.get("command"))))
             for s in by_entry.get(e["id"], []):
-                label = verb[s["action"]]
-                note = {"restore": "(was modified)", "recreate": "(was deleted)", "remove": "(was created)",
-                        "unchanged": "(already at the old content)"}[s["action"]]
                 if s["conflict"] and not args.force:
-                    print("    SKIP      %s  changed again after that Bash call; use --force to overwrite" % s["rel"])
+                    print("    SKIPPED         %s (changed again after that Bash call; --force overwrites it)"
+                          % s["rel"])
                     failed += 1
                     incomplete.add(e["id"])
                     continue
-                prefix = ("would " + label) if args.dry_run else label
-                print("    %-15s %s %s" % (prefix, s["rel"], note))
+                label = future[s["action"]] if args.dry_run else past[s["action"]]
                 if args.dry_run or s["action"] == "unchanged":
+                    print("    %-15s %s %s" % (label, s["rel"], note[s["action"]]))
                     continue
                 try:
                     if s["action"] == "remove":
                         remove_path(store, s["rel"])
                     else:
                         write_blob_to(store, s["pre_tree"], s["rel"])
+                    done += 1
+                    print("    %-15s %s %s" % (label, s["rel"], note[s["action"]]))
                 except OSError as ex:
-                    print("    FAILED    %s: %s" % (s["rel"], ex))
+                    print("    FAILED          %s: %s" % (s["rel"], ex))
                     failed += 1
                     incomplete.add(e["id"])
         if not args.dry_run:
@@ -183,8 +191,12 @@ def cmd_undo(args) -> int:
                     e["undone"] = True
                     e["undone_ts"] = time.time()
             store.save_entries(all_entries)
+    if args.dry_run:
+        print("Nothing was changed. To apply: /bash-undo %d   (or: bash-bridge undo %d)" % (len(entries), len(entries)))
+    else:
+        print("Done: %d file(s) changed back." % done)
     if failed:
-        print("bash-bridge: %d file(s) skipped or failed" % failed)
+        print("%d file(s) skipped or failed." % failed)
     return 0 if not failed else 2
 
 
