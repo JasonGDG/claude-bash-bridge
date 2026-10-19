@@ -151,7 +151,11 @@ Environment variables override the files, and you can set them in `settings.json
 * **Command hooks only.** `http`, `mcp_tool`, `prompt` and `agent` hooks, hooks from skill or agent frontmatter, and PowerShell hooks are not bridged. Plugins loaded with `--plugin-dir` are invisible unless you list them in `BASH_BRIDGE_PLUGIN_DIRS`. `settings.json` is read directly, so a `--setting-sources` flag isn't known: use `BASH_BRIDGE_SOURCES`.
 * **Rules arrive one step late:** after the Bash write, not before. Claude then fixes the file, which is what the end-to-end runs show. The glob matcher mirrors Claude Code's documented syntax but isn't its code. For nested `.claude/rules`, globs are relative to the folder that contains the `.claude` folder; that's an assumption.
 * **Synthesized `Edit` payloads** carry the changed line range, not Claude's exact `old_string`. Hooks that rebuild a patch from it see a line-level diff.
-* **Undo covers Bash changes only.** Edit/Write changes are still for `/rewind`. Entries older than 7 days can be garbage-collected; the last 300 per project are kept.
+* **Undo covers Bash changes only.** Edit/Write changes are still for `/rewind`. Snapshots older than 14 days are pruned by a background `git gc` (at most every 3 days); the log keeps the last 300 calls per project.
+
+## Trust
+
+bash-bridge runs the same hook commands Claude Code would run: the ones in your settings files and enabled plugins. Claude Code runs project hooks only in a workspace you have trusted (or in `-p` mode, which skips the trust dialog), and bash-bridge only runs inside such a session. To keep project hooks out of it, set `BASH_BRIDGE_SOURCES=user,plugins`.
 
 ## Uninstall
 
