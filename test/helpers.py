@@ -16,6 +16,10 @@ BIN = os.path.join(ROOT, "bin", "bash-bridge")
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 
 
+# bash-bridge runs the hooks of several files in parallel: each event goes to its own file
+LOG_BODY = 'd=$(cat); mkdir -p "$HOOK_LOG.d"; f=$(mktemp "$HOOK_LOG.d/e.XXXXXX"); printf "%s" "$d" > "$f"\n'
+
+
 def sh(cmd, cwd, env=None, check=True):
     p = subprocess.run(["/bin/bash", "-c", cmd], cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if check and p.returncode != 0:
@@ -101,7 +105,7 @@ class BridgeCase(unittest.TestCase):
         return path
 
     def logging_hook(self, matcher="Write|Edit", event="PostToolUse", where="project", extra=None):
-        script = self.hook_script("log-%s.sh" % event, 'd=$(cat); printf "%s\\n" "$d" >> "$HOOK_LOG"\n')
+        script = self.hook_script("log-%s.sh" % event, LOG_BODY)
         h = {"type": "command", "command": script}
         if extra:
             h.update(extra)
@@ -109,13 +113,21 @@ class BridgeCase(unittest.TestCase):
         return script
 
     def hook_log(self):
-        if not os.path.exists(self.log):
-            return []
+        """Events logged by LOG_BODY hooks (one file each, so parallel hooks can't interleave),
+        plus lines appended to $HOOK_LOG by simpler test hooks."""
         res = []
-        for line in open(self.log):
-            line = line.strip()
-            if line:
-                res.append(json.loads(line))
+        d = self.log + ".d"
+        if os.path.isdir(d):
+            names = sorted(os.listdir(d), key=lambda n: (os.stat(os.path.join(d, n)).st_mtime_ns, n))
+            for n in names:
+                with open(os.path.join(d, n)) as fh:
+                    res.append(json.loads(fh.read()))
+        if os.path.exists(self.log):
+            with open(self.log) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        res.append(json.loads(line))
         return res
 
     def event(self, mode, cmd, tuid, cwd=None):

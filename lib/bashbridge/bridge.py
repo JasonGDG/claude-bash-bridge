@@ -158,6 +158,53 @@ def _caller(event):
     return event.get("session_id") or "nosession", event.get("agent_id") or ""
 
 
+def _finished_ids(transcript_path, ids, tail_bytes=4 * 1024 * 1024):
+    """tool_use ids that already have a tool_result in the transcript (ran, failed or were denied)."""
+    found = set()
+    if not transcript_path or not ids:
+        return found
+    try:
+        with open(transcript_path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - tail_bytes))
+            data = fh.read()
+    except OSError:
+        return found
+    for i in ids:
+        b = i.encode()
+        for pat in (b'"tool_use_id":"' + b + b'"', b'"tool_use_id": "' + b + b'"'):
+            pos = data.find(pat)
+            while pos >= 0:
+                line_start = data.rfind(b"\n", 0, pos) + 1
+                line_end = data.find(b"\n", pos)
+                if b"tool_result" in data[line_start:line_end if line_end >= 0 else len(data)]:
+                    found.add(i)
+                    break
+                pos = data.find(pat, pos + 1)
+            if i in found:
+                break
+    return found
+
+
+def _prune_finished(store, event, own):
+    """Drop pending snapshots of this session's calls that already have a result in the transcript:
+    e.g. a call denied by a permission rule after its PreToolUse ran (it never gets a PostToolUse).
+    Otherwise such a call would look like a concurrent one and switch the guard rollback off."""
+    sid, agent = _caller(event)
+    cands = {}
+    for p in store.fresh_pending(own, sid, agent, max_age_s=3600):
+        data = read_json(p, None) or {}
+        if data.get("session") == sid and data.get("tuid"):
+            cands[data["tuid"]] = p
+    for tuid in _finished_ids(event.get("transcript_path"), list(cands)):
+        try:
+            os.remove(cands[tuid])
+            debug("dropped pending of finished call %s" % tuid)
+        except OSError:
+            pass
+
+
 def handle_pre(event, cfg):
     ti = event.get("tool_input") or {}
     cmd = ti.get("command") or ""
@@ -171,7 +218,7 @@ def handle_pre(event, cfg):
     store = Store(worktree)
     tuid = event.get("tool_use_id") or "unknown"
     sid, agent = _caller(event)
-    base = {"ts": time.time(), "project_dir": project_dir, "session": sid, "agent": agent}
+    base = {"ts": time.time(), "project_dir": project_dir, "session": sid, "agent": agent, "tuid": tuid}
     t0 = time.time()
     try:
         with store.lock(timeout=5.0):
@@ -180,11 +227,13 @@ def handle_pre(event, cfg):
             tree = store.snapshot(cfg, first=first)
             # another Bash call between its pre and post in this project? then neither call
             # can tell which changes are its own
+            _prune_finished(store, event, tuid)
             others = store.fresh_pending(tuid, sid, agent)
             for o in others:
-                store.mark_overlap(o)
+                store.mark_overlap(o, tuid)
             store.save_pending(tuid, dict(base, tree=tree, big=store.big, unreadable=store.unreadable,
-                                          overlap=bool(others)))
+                                          overlap=bool(others),
+                                          overlap_with=[(read_json(o, None) or {}).get("tuid") for o in others]))
     except Disabled as e:
         store.save_pending(tuid, dict(base, disabled=str(e)))
         return None
@@ -225,6 +274,31 @@ def handle_batch(event, cfg):
         sid, agent = _caller(event)
         store.drop_pending_of(sid, agent)
     return None
+
+
+def _finished_only_denied(event, ids):
+    """True if every call we overlapped with ended without running (its result is a denial)."""
+    ids = [i for i in (ids or []) if i]
+    if not ids:
+        return False
+    path = event.get("transcript_path")
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 4 * 1024 * 1024))
+            data = fh.read()
+    except (OSError, TypeError):
+        return False
+    for i in ids:
+        ok = False
+        for line in data.split(b"\n"):
+            if i.encode() in line and b"tool_result" in line and (
+                    (b"Permission to use" in line and b"has been denied" in line) or b"PreToolUse:Bash hook error" in line):
+                ok = True
+                break
+        if not ok:
+            return False
+    return True
 
 
 def _rel(path, project_dir, worktree):
@@ -293,7 +367,12 @@ def handle_post(event, cfg, failure=False):
             changes = _classify_big(changes, pending.get("big") or {}, store.big, store.worktree)
             new_unreadable = sorted(set(store.unreadable) - set(pending.get("unreadable") or []))
             changes += [("U", rel) for rel in new_unreadable if (("A", rel) not in changes)]
-            overlap = bool(pending.get("overlap")) or bool(store.fresh_pending(tuid, sid, agent))
+            _prune_finished(store, event, tuid)
+            others = store.fresh_pending(tuid, sid, agent)
+            # an overlap flagged at pre time only counts if that other call is still unfinished now
+            # or really ran (it has a result and changed files); a denied call is pruned above
+            overlap = bool(others) or (bool(pending.get("overlap")) and bool(pending.get("overlap_with")) and
+                                       not _finished_only_denied(event, pending.get("overlap_with")))
     except Disabled:
         return None
     if not changes:

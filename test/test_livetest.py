@@ -5,7 +5,7 @@ import os
 import stat
 import time
 
-from helpers import BridgeCase, sh, unittest
+from helpers import LOG_BODY, BridgeCase, sh, unittest
 
 from test_review import state_store
 
@@ -41,6 +41,27 @@ class Bug1OrphanPending(BridgeCase):
         self.assertEqual(self.run_hook("permission-denied", ev)[:2], (0, ""))
         out = self.bash("echo hacked >> protected.txt")
         self.assertIn("restored", out["reason"])
+
+    def test_denied_call_in_the_same_batch(self):
+        """The real p20d shape: `touch` (denied by a rule) and the echo in ONE batch. The pre hooks of
+        both run before the denial, so only the transcript shows that touch never ran."""
+        self.deny_touch()
+        self.run_hook("pre", self.event("pre", "echo hacked >> protected.txt", "toolu_echo"))
+        with open(self.transcript, "a") as fh:
+            fh.write(json.dumps({"type": "user", "message": {"content": [{"type": "tool_result",
+                     "tool_use_id": "toolu_denied", "is_error": True,
+                     "content": "Permission to use Bash with command touch made.txt has been denied."}]}}) + "\n")
+        sh("echo hacked >> protected.txt", self.proj)
+        code, out, _e, _t = self.run_hook("post", self.event("post", "echo hacked >> protected.txt", "toolu_echo"))
+        self.assertIn("restored", json.loads(out)["reason"])
+        self.assertEqual(self.read("protected.txt"), "keep\n")
+
+    def test_same_batch_without_transcript_evidence_stays_ambiguous(self):
+        self.deny_touch()
+        self.run_hook("pre", self.event("pre", "echo hacked >> protected.txt", "toolu_echo"))
+        sh("echo hacked >> protected.txt", self.proj)
+        code, out, _e, _t = self.run_hook("post", self.event("post", "echo hacked >> protected.txt", "toolu_echo"))
+        self.assertIn("at the same time", json.loads(out)["reason"])
 
     def test_other_session_in_flight_still_counts_as_overlap(self):
         other = self.event("pre", "echo z > z.txt", "toolu_other")
@@ -88,7 +109,7 @@ class Bug3CommandNotInPayload(BridgeCase):
             self.assertEqual(self.read("page%d.txt" % i), "x\ny\n")
         with open(self.log + ".cmd") as fh:
             self.assertIn("cat protected.txt", fh.read(), "the command is available as $BASH_BRIDGE_COMMAND")
-        log = self.hook_script("l.sh", 'd=$(cat); printf "%s\\n" "$d" >> "$HOOK_LOG"\n')
+        log = self.hook_script("l.sh", LOG_BODY)
         self.settings({"hooks": {"PostToolUse": [{"matcher": "Edit", "hooks": [{"type": "command", "command": log}]}]}})
         self.bash(cmd)
         for e in self.hook_log():

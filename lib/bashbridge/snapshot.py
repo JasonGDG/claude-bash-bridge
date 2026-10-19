@@ -593,10 +593,11 @@ class Store:
                     pass
         return n
 
-    def mark_overlap(self, path: str) -> None:
+    def mark_overlap(self, path: str, other: str = "") -> None:
         data = read_json(path, None)
-        if isinstance(data, dict) and not data.get("overlap"):
+        if isinstance(data, dict):
             data["overlap"] = True
+            data["overlap_with"] = list(data.get("overlap_with") or []) + [other]
             write_json_atomic(path, data)
 
     def prune_pending(self, max_age_s: float = 86400) -> None:
