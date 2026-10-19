@@ -21,7 +21,8 @@ sys.exit(main(sys.argv[1:]))
 '
 if [ "$1" = "hook" ]; then
   if [ -z "$py" ]; then cat >/dev/null 2>&1; exit 0; fi
-  PYTHONDONTWRITEBYTECODE=1 "$py" -I -c "$code" "$root/lib" "$@" 2>/dev/null
+  # the process that started this hook (Claude Code); pending calls of a process that is gone don't count
+  BASH_BRIDGE_HOOK_PPID=$PPID PYTHONDONTWRITEBYTECODE=1 "$py" -I -c "$code" "$root/lib" "$@" 2>/dev/null
   exit 0
 fi
 if [ -z "$py" ]; then

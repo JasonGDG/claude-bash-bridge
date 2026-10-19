@@ -263,8 +263,9 @@ def _subst(text: str, env: dict) -> str:
 
 
 class Result:
-    def __init__(self, handler, code, stdout, stderr, timed_out=False, error=None):
+    def __init__(self, handler, code, stdout, stderr, timed_out=False, error=None, skipped=False):
         self.handler = handler
+        self.skipped = skipped  # not started: the hook budget was used up
         self.code = code
         self.stdout = stdout
         self.stderr = stderr
@@ -341,22 +342,31 @@ def run_handler(h: Handler, payload: dict, project_dir: str, cwd: str, timeout_c
         return Result(h, None, "", "", timed_out=True)
 
 
-def run_parallel(handlers, payload, project_dir, cwd, timeout_cap, extra_env=None):
+KILL_GRACE_S = 3.0
+
+
+def run_parallel(handlers, payload, project_dir, cwd, timeout_cap, extra_env=None, deadline=None):
+    """Run one file's handlers at the same time. Each gets min(its own timeout, timeout_cap, time left
+    until deadline); run_handler kills it then, so every thread ends within that plus KILL_GRACE_S.
+    A handler that would start after the deadline is reported as skipped."""
     results = [None] * len(handlers)
+    left = timeout_cap if deadline is None else min(timeout_cap, deadline - time.time())
+    if left <= 0:
+        return [Result(h, None, "", "", skipped=True) for h in handlers]
 
     def work(i, h):
         try:
-            results[i] = run_handler(h, payload, project_dir, cwd, timeout_cap, extra_env)
+            results[i] = run_handler(h, payload, project_dir, cwd, left, extra_env)
         except Exception as e:  # pragma: no cover - defensive
             results[i] = Result(h, None, "", "", error=str(e))
 
     threads = [threading.Thread(target=work, args=(i, h), daemon=True) for i, h in enumerate(handlers)]
     for t in threads:
         t.start()
-    deadline = time.time() + timeout_cap + 5
+    end = time.time() + max(0.5, left) + KILL_GRACE_S
     for t in threads:
-        t.join(max(0.1, deadline - time.time()))
-    return [r for r in results if r is not None]
+        t.join(max(0.1, end - time.time()))
+    return [r if r is not None else Result(h, None, "", "", timed_out=True) for h, r in zip(handlers, results)]
 
 
 def interpret_post(r: Result):
@@ -406,13 +416,14 @@ def interpret_pre(r: Result):
     return out
 
 
-def run_many(tasks, project_dir, cwd, timeout_cap, extra_env=None, workers: int = 4):
+def run_many(tasks, project_dir, cwd, timeout_cap, extra_env=None, workers: int = 4, deadline=None):
     """tasks: [(key, handlers, payload)]. Runs the files in parallel (a small pool, each file's
-    handlers in parallel too) and returns [(key, results)] in the order of tasks."""
+    handlers in parallel too) and returns [(key, results)] in the order of tasks. deadline is one
+    absolute time for all of them: no handler starts after it, and running ones are cut off at it."""
     if not tasks:
         return []
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(tasks)))) as ex:
-        futs = [ex.submit(run_parallel, hs, payload, project_dir, cwd, timeout_cap, extra_env)
+        futs = [ex.submit(run_parallel, hs, payload, project_dir, cwd, timeout_cap, extra_env, deadline)
                 for _key, hs, payload in tasks]
         return [(tasks[i][0], f.result()) for i, f in enumerate(futs)]

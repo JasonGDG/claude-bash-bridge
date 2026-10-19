@@ -149,6 +149,19 @@ def store_dir_for(worktree: str) -> str:
     return os.path.join(state_dir(), "projects", project_key(worktree))
 
 
+def pid_alive(pid) -> bool:
+    """False only when pid names a process that certainly no longer exists."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 class Store:
     def __init__(self, worktree: str):
         self.worktree = os.path.realpath(worktree)
@@ -217,15 +230,18 @@ class Store:
         self.save_meta(meta)
         shutil.rmtree(self.gitdir, ignore_errors=True)
 
-    def disable(self, reason: str, hours: float = 24.0) -> None:
+    BACKOFF_S = 600
+
+    def disable(self, reason: str, cfg=None) -> None:
+        """Pause bash-bridge for this project: BACKOFF_S (10 minutes) by default, so a project that is
+        too big or too slow is not re-measured on every call; longer only if the user set disable_hours
+        in ~/.claude/bash-bridge.json. The shadow repo is kept (its last good state stays valid)."""
+        hours = float((cfg or {}).get("disable_hours") or 0)
         meta = self.meta()
-        meta["disabled_until"] = time.time() + hours * 3600
+        meta["disabled_until"] = time.time() + (hours * 3600 if hours > 0 else self.BACKOFF_S)
         meta["disabled_reason"] = reason
         meta["worktree"] = self.worktree
-        meta["ready"] = False
         self.save_meta(meta)
-        # free the space: a half-built shadow repo is useless while disabled
-        shutil.rmtree(self.gitdir, ignore_errors=True)
         debug("disabled %s: %s" % (self.worktree, reason))
 
     def _real_gitdir(self):
@@ -364,15 +380,15 @@ class Store:
         if is_git:
             n = self._index_entry_count(os.path.join(real_gitdir, "index"))
             if n > max_files:
-                self.disable("%d tracked files exceed max_files=%d" % (n, max_files), hours=24 * 7)
+                self.disable("%d tracked files exceed max_files=%d" % (n, max_files), cfg)
                 raise Disabled(self.meta()["disabled_reason"])
         else:
-            n = self._count_files(dict(cfg, max_files=min(int(cfg.get("max_files", 100000)),
-                                                          int(cfg.get("max_untracked", 5000)))),
-                                  int(cfg.get("scan_ms", 400)))
+            # without git every file is untracked, so max_untracked caps the whole folder
+            cap = min(max_files, int(cfg.get("max_untracked", 5000)))
+            n = self._count_files(dict(cfg, max_files=cap), int(cfg.get("scan_ms", 400)))
             if n is None:
-                self.disable("more than max_files=%d files (or the scan took over %d ms)"
-                             % (max_files, int(cfg.get("scan_ms", 400))), hours=24)
+                self.disable("this folder has no git and more than %d files (max_untracked / max_files), or "
+                             "counting them took over %d ms" % (cap, int(cfg.get("scan_ms", 400))), cfg)
                 raise Disabled(self.meta()["disabled_reason"])
         if os.path.isdir(self.gitdir):
             shutil.rmtree(self.gitdir, ignore_errors=True)
@@ -423,23 +439,30 @@ class Store:
         self.save_meta(meta)
 
     # ------------------------------------------------------------------ snapshot
-    def snapshot(self, cfg: dict, first: bool = False) -> str:
+    skipped_untracked = 0
+
+    def snapshot(self, cfg: dict, first: bool = False, skip_untracked: bool = False) -> str:
+        """Hash what changed since the last snapshot and return the tree. More than max_untracked
+        untracked files (or skip_untracked, when this call's pre snapshot had to do that) only
+        degrades this snapshot: files outside the index are left out, tracked ones are still
+        hashed, and self.skipped_untracked says how many were left out."""
         budget = int(cfg.get("first_snapshot_ms" if first else "snapshot_ms", 3000)) / 1000.0
         start = time.time()
         max_bytes = int(cfg.get("max_file_bytes", 20 * 1024 * 1024))
         max_files = int(cfg.get("max_files", 100000))
         try:
-            out = self.git(["ls-files", "-z", "-m", "-d", "-o", "--exclude-standard"], timeout=budget)
+            out = self.git(["ls-files", "-z", "-t", "-m", "-d", "-o", "--exclude-standard"], timeout=budget)
         except SnapshotError as e:
             if "timed out" in str(e):
-                self.disable("listing changes took longer than %d ms" % int(budget * 1000), hours=6)
+                self.disable("listing changes took longer than %d ms" % int(budget * 1000), cfg)
                 raise Disabled(self.meta()["disabled_reason"])
             raise
-        paths = []
+        paths, others = [], set()
         seen = set()
         self.big, self.unreadable = {}, []
-        untracked = 0
-        for raw in out.split(b"\0"):
+        self.skipped_untracked = 0
+        for rec in out.split(b"\0"):
+            tag, _sp, raw = rec.partition(b" ")
             if not raw or raw.endswith(b"/") or raw in seen:
                 continue  # nested repositories show up as "dir/"
             seen.add(raw)
@@ -455,24 +478,29 @@ class Store:
                     if os.path.isfile(full) and not os.access(full, os.R_OK):
                         self.unreadable.append(rel)
                         continue
-                untracked += 1
+                if tag == b"?":
+                    others.add(raw)
             except OSError:
                 pass  # deleted: update-index --remove handles it
             paths.append(raw)
         max_untracked = int(cfg.get("max_untracked", 5000))
-        if first and untracked > max_untracked and self.meta().get("is_git"):
-            # unseeded git projects list tracked files too; count only what git itself calls untracked
-            try:
-                real = run_git(["-C", self.worktree, "ls-files", "-o", "-z", "--exclude-standard"], timeout=budget)
-                untracked = len([r for r in real.split(b"\0") if r and not r.endswith(b"/")])
-            except SnapshotError:
-                pass
-        if first and untracked > max_untracked:
-            self.disable("%d files to snapshot (not ignored by .gitignore) exceed max_untracked=%d"
-                         % (untracked, max_untracked), hours=24 * 7)
-            raise Disabled(self.meta()["disabled_reason"])
+        if others and (skip_untracked or len(others) > max_untracked):
+            leave_out = others
+            if not skip_untracked and first and self.meta().get("is_git"):
+                # an unseeded shadow index lists the project's tracked files as "others" too: only
+                # what git itself calls untracked counts, and only that is left out
+                try:
+                    real = run_git(["-C", self.worktree, "ls-files", "-o", "-z", "--exclude-standard"], timeout=budget)
+                    real_set = {r for r in real.split(b"\0") if r and not r.endswith(b"/")}
+                    leave_out = others & real_set if len(real_set) > max_untracked else set()
+                except SnapshotError:
+                    pass
+            if leave_out:
+                self.skipped_untracked = len(leave_out)
+                paths = [p for p in paths if p not in leave_out]
+                debug("snapshot leaves out %d untracked files (max_untracked=%d)" % (len(leave_out), max_untracked))
         if len(paths) > max_files:
-            self.disable("%d changed/untracked files exceed max_files=%d" % (len(paths), max_files), hours=24 * 7)
+            self.disable("%d changed/untracked files exceed max_files=%d" % (len(paths), max_files), cfg)
             raise Disabled(self.meta()["disabled_reason"])
         if self.big:
             self.git(["update-index", "-z", "--force-remove", "--stdin"],
@@ -484,7 +512,7 @@ class Store:
                          input_bytes=b"\0".join(paths) + b"\0", timeout=remaining)
             except SnapshotError as e:
                 if "timed out" in str(e):
-                    self.disable("hashing changed files took longer than %d ms" % int(budget * 1000), hours=6)
+                    self.disable("hashing changed files took longer than %d ms" % int(budget * 1000), cfg)
                     raise Disabled(self.meta()["disabled_reason"])
                 debug("update-index failed (%s); retrying path by path" % e)
                 for raw in paths[:2000]:
@@ -542,6 +570,12 @@ class Store:
     def save_pending(self, tool_use_id: str, data: dict) -> None:
         write_json_atomic(self.pending_path(tool_use_id), data)
 
+    def read_pending(self, tool_use_id: str):
+        path = self.pending_path(tool_use_id)
+        check_private_file(path)
+        data = read_json(path, None)
+        return data if isinstance(data, dict) else None
+
     def pop_pending(self, tool_use_id: str):
         path = self.pending_path(tool_use_id)
         check_private_file(path)
@@ -552,52 +586,85 @@ class Store:
             pass
         return data
 
-    def fresh_pending(self, exclude: str, session: str = "", agent: str = "", max_age_s: float = 120):
-        """Other calls in this project that took a pre-snapshot and are not finished.
-        Pending entries of calls that never ran (denied) are removed by the PermissionDenied and
-        PostToolBatch hooks; the short window only matters on Claude Code versions without them."""
+    PENDING_MAX_AGE_S = 3600   # a Bash call runs at most 10 minutes by default; older entries are stale
+    PENDING_MAX_COUNT = 200
+
+    def pending_entries(self, exclude: str = ""):
+        """[(path, data)] of the other pending calls in this project, oldest first. Prunes on the way:
+        unreadable entries, entries older than PENDING_MAX_AGE_S or dated in the future (clock jump),
+        and everything beyond PENDING_MAX_COUNT. Age comes from the stored creation time, not the
+        file's mtime (mark_overlap rewrites the file). Call with the store lock held."""
         from .util import safe_id
-        res = []
-        mine = safe_id(exclude) + ".json"
+        mine = safe_id(exclude) + ".json" if exclude else None
         try:
             names = os.listdir(self.pending_dir)
         except OSError:
-            return res
+            return []
+        now = time.time()
+        live = []
         for name in names:
             p = os.path.join(self.pending_dir, name)
-            try:
-                if name == mine or not name.endswith(".json") or time.time() - os.path.getmtime(p) > max_age_s:
-                    continue
-            except OSError:
+            if name == mine or not name.endswith(".json"):
                 continue
             data = read_json(p, None)
-            if not isinstance(data, dict) or data.get("disabled"):
+            ts = data.get("ts") if isinstance(data, dict) else None
+            age = now - ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None
+            if age is None or age > self.PENDING_MAX_AGE_S or age < -60:
+                self._drop(p, "stale pending %s" % name)
+                continue
+            live.append((ts, p, data))
+        live.sort(key=lambda x: x[0])
+        while len(live) > self.PENDING_MAX_COUNT:
+            self._drop(live.pop(0)[1], "pending over the cap")
+        return [(p, d) for _ts, p, d in live]
+
+    @staticmethod
+    def _drop(path, why=""):
+        try:
+            os.remove(path)
+            debug("removed %s" % (why or path))
+        except OSError:
+            pass
+
+    def fresh_pending(self, exclude: str, max_age_s: float = 120):
+        """Other Bash calls in this worktree that took (or tried to take) a pre-snapshot and have not
+        finished: real concurrency, whatever session they belong to, because their writes land in the
+        same files. Calls whose pre is older than max_age_s, whose Claude Code process is gone, or that
+        were switched off (disabled) don't count. A call whose pre hook timed out on the lock
+        ("ambiguous") does count: it runs, and its writes can't be told apart from ours."""
+        res = []
+        now = time.time()
+        for p, data in self.pending_entries(exclude):
+            if data.get("disabled"):
+                continue
+            if now - float(data["ts"]) > max_age_s:
+                continue
+            if not pid_alive(data.get("pid")):
+                self._drop(p, "pending of an exited Claude Code process")
                 continue
             res.append(p)
         return res
 
-    def drop_pending_of(self, session: str, agent: str) -> int:
+    def drop_pending_ids(self, ids, session: str) -> int:
+        """Remove the pending entries of exactly these tool_use ids (PostToolBatch)."""
         n = 0
-        try:
-            names = os.listdir(self.pending_dir)
-        except OSError:
-            return 0
-        for name in names:
-            p = os.path.join(self.pending_dir, name)
-            data = read_json(p, None)
-            if isinstance(data, dict) and data.get("session") == session and (data.get("agent") or "") == agent:
-                try:
-                    os.remove(p)
-                    n += 1
-                except OSError:
-                    pass
+        for tuid in ids:
+            path = self.pending_path(tuid)
+            data = read_json(path, None)
+            if isinstance(data, dict) and data.get("session") == session and data.get("tuid") == tuid:
+                self._drop(path, "pending of resolved call %s" % tuid)
+                n += 1
         return n
 
-    def mark_overlap(self, path: str, other: str = "") -> None:
+    def mark_overlap(self, path: str, other: str = "", transcript=None) -> None:
         data = read_json(path, None)
         if isinstance(data, dict):
             data["overlap"] = True
             data["overlap_with"] = list(data.get("overlap_with") or []) + [other]
+            if other and transcript:
+                src = dict(data.get("overlap_src") or {})
+                src[other] = transcript
+                data["overlap_src"] = src
             write_json_atomic(path, data)
 
     def prune_pending(self, max_age_s: float = 86400) -> None:
@@ -757,9 +824,20 @@ class Store:
                 files.append({"st": st, "rel": rel, "pre": None, "post": None, "kept": False})
                 continue
             p = pre.get(rel)
-            files.append({"st": st, "rel": rel, "pre": list(p) if p else None,
-                          "post": list(post[rel]) if rel in post else None,
-                          "kept": (p is None) or (p[1] in stored)})
+            f = {"st": st, "rel": rel, "pre": list(p) if p else None,
+                 "post": list(post[rel]) if rel in post else None,
+                 "kept": (p is None) or (p[1] in stored)}
+            # permission bits beyond git's x bit: a file modified in place keeps its inode and mode,
+            # so the bits it has now are the ones to restore (when they agree with the old x bit)
+            if p and p[0] in ("100644", "100755"):
+                try:
+                    lst = os.lstat(os.path.join(self.worktree, rel))
+                    import stat as _st
+                    if _st.S_ISREG(lst.st_mode) and bool(lst.st_mode & 0o100) == (p[0] == "100755"):
+                        f["perm"] = lst.st_mode & 0o777
+                except OSError:
+                    pass
+            files.append(f)
         entry["files"] = files
 
     # ------------------------------------------------------------------ undo log
@@ -866,13 +944,11 @@ def _open_parent(store: Store, rel: str, create: bool):
                 import stat as _st
                 if _st.S_ISLNK(st.st_mode):
                     raise OSError("refusing to follow the symlink %s in %s" % (comp, rel))
-                if create and _st.S_ISREG(st.st_mode):
-                    os.unlink(comp, dir_fd=fd)  # a file now sits where the directory was
-                    os.mkdir(comp, 0o700, dir_fd=fd)
-                    nfd = os.open(comp, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=fd)
-                    os.fchmod(nfd, 0o777 & ~_user_umask())
-                else:
-                    raise e
+                if not _st.S_ISDIR(st.st_mode):
+                    # never delete what sits where a directory should be: undo removes such a file in
+                    # its own, checked step first; if that step was skipped, so is everything below it
+                    raise NotADirectoryError("%s is in the way of %s (not a directory); left alone" % (comp, rel))
+                raise e
             os.close(fd)
             fd = nfd
         return fd, parts[-1]
@@ -881,15 +957,29 @@ def _open_parent(store: Store, rel: str, create: bool):
         raise
 
 
-def write_file(store: Store, rel: str, mode: str, data: bytes) -> None:
+def _perm_for(mode: str, perm, existing):
+    """Permission bits for a restored file. git keeps only the x bit, so: the bits recorded in the
+    undo entry if they agree with the git mode, else those of the file being replaced if they
+    agree, else 0666/0777 minus the user's umask."""
+    want_x = mode == "100755"
+    for p in (perm, existing):
+        if isinstance(p, int) and not isinstance(p, bool) and 0 <= p <= 0o777 and bool(p & 0o100) == want_x:
+            return p
+    return (0o777 if want_x else 0o666) & ~_user_umask()
+
+
+def write_file(store: Store, rel: str, mode: str, data: bytes, perm=None) -> None:
     """Atomically put (mode, data) at rel via dir fds: never follows a symlink, at rel or above it."""
     import stat as _st
     dfd, name = _open_parent(store, rel, create=True)
+    existing = None
     try:
         try:
             st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
             if _st.S_ISDIR(st.st_mode):
                 os.rmdir(name, dir_fd=dfd)  # only an empty directory; anything else raises
+            elif _st.S_ISREG(st.st_mode):
+                existing = st.st_mode & 0o777
         except FileNotFoundError:
             pass
         tmp = ".%s.bash-bridge-%d" % (name[:80], os.getpid())
@@ -903,7 +993,7 @@ def write_file(store: Store, rel: str, mode: str, data: bytes) -> None:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600, dir_fd=dfd)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(data)
-                os.fchmod(fh.fileno(), (0o777 if mode == "100755" else 0o666) & ~_user_umask())
+                os.fchmod(fh.fileno(), _perm_for(mode, perm, existing))
         os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)  # replaces a symlink itself
     finally:
         os.close(dfd)

@@ -142,7 +142,8 @@ class F14F15StoreBounds(BridgeCase):
         d = config.DEFAULTS
         for k in ("keep_entries", "undo_max_bytes", "undo_days", "store_max_bytes", "hook_budget_s"):
             self.assertEqual(cfg[k], d[k], k)
-        self.assertEqual(cfg["max_file_bytes"], 1000, "lowering is allowed")
+        # review 3: a lower max_file_bytes would make every file "too large", so it is user-only now
+        self.assertEqual(cfg["max_file_bytes"], d["max_file_bytes"])
 
 
 class F16FdRelativeRestore(BridgeCase):
@@ -174,10 +175,11 @@ class F16FdRelativeRestore(BridgeCase):
     def test_file_in_place_of_directory_is_replaced(self):
         from bashbridge.snapshot import write_file
         sh("rm -r d && echo notadir > d", self.proj)
+        # review 3: a file in the way is never deleted by a restore (undo removes it in its own checked step)
         with in_env({"BASH_BRIDGE_STATE_DIR": self.state, "CLAUDE_PROJECT_DIR": self.proj}):
-            write_file(self.store(), "d/f.txt", "100755", b"back\n")
-        self.assertEqual(self.read("d/f.txt"), "back\n")
-        self.assertTrue(os.access(os.path.join(self.proj, "d/f.txt"), os.X_OK))
+            with self.assertRaises(OSError):
+                write_file(self.store(), "d/f.txt", "100755", b"back\n")
+        self.assertEqual(self.read("d"), "notadir\n")
 
     def test_dotdot_rejected(self):
         from bashbridge.snapshot import write_file

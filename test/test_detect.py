@@ -123,7 +123,7 @@ class HugeRepoCap(BridgeCase):
         elapsed = time.time() - start
         self.assertIsNotNone(out)
         self.assertIn("inactive", out.get("systemMessage", ""))
-        self.assertNotIn("hookSpecificOutput", out)
+        self.assertIn("inactive", self.context(out), "Claude is told too")
         self.assertLess(elapsed, 3.0)
         # the note is shown once per session, later calls stay silent
         out2 = self.bash("echo z > f/new2.txt", env=env)

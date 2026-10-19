@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end check against real Claude Code (`claude -p`), with and without bash-bridge.
 
-Usage: python3 test/e2e.py WORKDIR [--model haiku] [--only ARM,...] [--budget 0.4]
+Usage: python3 test/e2e.py WORKDIR [--model haiku] [--only ARM,...] [--budget 0.4] [--persist]
 
 Every arm gets a fresh git project under WORKDIR/<arm>/proj with
   * .claude/settings.json: a PostToolUse "Write|Edit" logging hook, a PreToolUse
@@ -142,7 +142,7 @@ def read_jsonl(path):
     return res
 
 
-def run_arm(work, name, model, budget, claude):
+def run_arm(work, name, model, budget, claude, persist=False):
     prompt, plugin, mode = ARMS[name][:3]
     extra = list(ARMS[name][3]) if len(ARMS[name]) > 3 else []
     base = os.path.join(work, name)
@@ -156,8 +156,10 @@ def run_arm(work, name, model, budget, claude):
         "BASH_BRIDGE_DEBUG": os.path.join(base, "bridge.debug.log"),
     })
     cmd = [claude, "-p", prompt, "--model", model, "--output-format", "stream-json", "--verbose",
-           "--setting-sources", "project,local", "--permission-mode", mode, "--max-budget-usd", str(budget),
-           "--no-session-persistence"]
+           "--setting-sources", "project,local", "--permission-mode", mode, "--max-budget-usd", str(budget)]
+    if not persist:
+        # without a transcript, bash-bridge can't see that a call in the same batch was denied
+        cmd.append("--no-session-persistence")
     if plugin:
         cmd += ["--plugin-dir", ROOT]
     cmd += extra
@@ -227,6 +229,7 @@ def main():
     ap.add_argument("--model", default="haiku")
     ap.add_argument("--only", default="")
     ap.add_argument("--budget", type=float, default=0.4)
+    ap.add_argument("--persist", action="store_true", help="keep session transcripts (the denied-guard arm needs one)")
     ap.add_argument("--claude", default=shutil.which("claude") or os.path.expanduser("~/.local/bin/claude"))
     a = ap.parse_args()
     work = os.path.realpath(a.work)
@@ -238,7 +241,7 @@ def main():
         results = [r for r in json.load(open(out_path)) if r["arm"] not in arms]
     for name in arms:
         print("== %s" % name, flush=True)
-        r = run_arm(work, name, a.model, a.budget, a.claude)
+        r = run_arm(work, name, a.model, a.budget, a.claude, a.persist)
         print(json.dumps({k: r[k] for k in r if k not in ("stderr_tail", "undo_output", "final")}), flush=True)
         results.append(r)
         with open(out_path, "w") as fh:

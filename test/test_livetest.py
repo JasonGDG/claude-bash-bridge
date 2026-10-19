@@ -28,7 +28,9 @@ class Bug1OrphanPending(BridgeCase):
 
     def test_batch_hook_clears_denied_call(self):
         self.deny_touch()
-        ev = {"session_id": self.session, "hook_event_name": "PostToolBatch", "cwd": self.proj}
+        ev = {"session_id": self.session, "hook_event_name": "PostToolBatch", "cwd": self.proj,
+              "tool_calls": [{"tool_name": "Bash", "tool_input": {"command": "touch made.txt"},
+                              "tool_use_id": "toolu_denied", "tool_response": "Permission denied"}]}
         self.assertEqual(self.run_hook("batch", ev)[:2], (0, ""))
         out = self.bash("echo hacked >> protected.txt")
         self.assertIn("restored", out["reason"])
@@ -50,7 +52,8 @@ class Bug1OrphanPending(BridgeCase):
         with open(self.transcript, "a") as fh:
             fh.write(json.dumps({"type": "user", "message": {"content": [{"type": "tool_result",
                      "tool_use_id": "toolu_denied", "is_error": True,
-                     "content": "Permission to use Bash with command touch made.txt has been denied."}]}}) + "\n")
+                     "content": "Permission to use Bash with command touch made.txt has been denied."}]},
+                     "toolDenialKind": "permission-rule"}) + "\n")
         sh("echo hacked >> protected.txt", self.proj)
         code, out, _e, _t = self.run_hook("post", self.event("post", "echo hacked >> protected.txt", "toolu_echo"))
         self.assertIn("restored", json.loads(out)["reason"])
@@ -144,20 +147,33 @@ class Bug4LockTimeout(BridgeCase):
 
 
 class Bug5ManyUntracked(BridgeCase):
-    def test_untracked_cap_disables_fast_and_cleans_up(self):
+    def test_untracked_cap_degrades_only_the_call(self):
+        """Review 3: too many untracked files no longer switch bash-bridge off for 7 days; the call
+        snapshots tracked files only and says so (to the user and to Claude), rate-limited."""
         self.write("a.txt", "a\n")
         self.commit()
         for i in range(80):
             self.write("gen/%03d.txt" % i, "x")
         env = dict(self.env, BASH_BRIDGE_MAX_UNTRACKED="50")
         start = time.time()
-        out = self.bash("echo x >> a.txt", env=env)
+        out = self.bash("echo x >> a.txt && echo n > gen/new.txt", env=env)
         self.assertLess(time.time() - start, 5)
         self.assertIn("max_untracked", out["systemMessage"])
+        self.assertIn("max_untracked", self.context(out))
+        self.assertEqual(self.last_changes(), [("M", "a.txt")], "tracked files are still covered")
         store = state_store(self)
-        self.assertFalse(os.path.exists(os.path.join(store, "shadow.git")), "no half-built shadow repo is kept")
         with open(os.path.join(store, "meta.json")) as fh:
-            self.assertGreater(json.load(fh)["disabled_until"], time.time() + 6 * 86400)
+            self.assertLess(json.load(fh).get("disabled_until", 0), time.time())
+        self.assertTrue(os.path.isdir(os.path.join(store, "shadow.git")))
+        out = self.bash("echo y >> a.txt", env=env)
+        self.assertIsNone(out, "the note is rate-limited")
+        code, txt, _ = self.cli("undo", "--project", self.proj, env=env)
+        self.assertEqual(code, 0, txt)
+        self.assertEqual(self.read("a.txt"), "a\nx\n")
+        # back under the cap: untracked files are tracked again, nothing shows up as created
+        sh("rm -r gen", self.proj)
+        self.bash("echo z > new.txt", env=env)
+        self.assertEqual(self.last_changes(), [("A", "new.txt")])
 
 
 class Bug6TooLarge(BridgeCase):

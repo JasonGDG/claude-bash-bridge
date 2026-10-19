@@ -163,7 +163,7 @@ def plan_undo(store, entries, force=False):
             elif pre and (not f.get("kept", True) or store.load_blob(pre[1]) is None):
                 action = "expired"
             steps.append({"entry": e["id"], "rel": rel, "action": action, "conflict": conflict,
-                          "expected": current if rel in virtual else post, "pre": pre})
+                          "expected": current if rel in virtual else post, "pre": pre, "perm": f.get("perm")})
             if action != "expired" and (not conflict or force):
                 virtual[rel] = pre
     return steps
@@ -179,6 +179,15 @@ def cmd_undo(args) -> int:
             "remove": "(the Bash call created it)", "unchanged": "(already back at the old content)"}
     failed = done = 0
     incomplete = set()
+    blocked = set()  # paths left as they are: nothing below them may be touched either
+
+    def blocked_parent(rel):
+        parts = rel.split("/")
+        for i in range(1, len(parts)):
+            p = "/".join(parts[:i])
+            if p in blocked:
+                return p
+        return None
     with store.lock(timeout=10.0):
         entries = [e for e in store.load_entries() if not e.get("undone")]
         if args.session:
@@ -215,24 +224,35 @@ def cmd_undo(args) -> int:
                 continue
             for st in by_entry.get(e["id"], []):
                 rel = show(st["rel"])
+                parent = blocked_parent(st["rel"])
+                if parent is not None and st["action"] != "unchanged":
+                    print("    SKIPPED         %s (%s above it was left alone, so this is too)" % (rel, show(parent)))
+                    blocked.add(st["rel"])
+                    failed += 1
+                    incomplete.add(e["id"])
+                    continue
                 if st["action"] == "toolarge":
                     print("    TOO LARGE       %s (over max_file_bytes when it changed; not snapshotted, cannot undo)"
                           % rel)
+                    blocked.add(st["rel"])
                     failed += 1
                     incomplete.add(e["id"])
                     continue
                 if st["action"] == "unreadable":
                     print("    UNREADABLE      %s (created without read permission; not snapshotted, left alone)" % rel)
+                    blocked.add(st["rel"])
                     failed += 1
                     incomplete.add(e["id"])
                     continue
                 if st["action"] == "expired":
                     print("    EXPIRED         %s (its previous content is no longer stored; cannot undo)" % rel)
+                    blocked.add(st["rel"])
                     failed += 1
                     incomplete.add(e["id"])
                     continue
                 if st["conflict"] and not args.force:
                     print("    SKIPPED         %s (changed again after that Bash call; --force overwrites it)" % rel)
+                    blocked.add(st["rel"])
                     failed += 1
                     incomplete.add(e["id"])
                     continue
@@ -244,6 +264,7 @@ def cmd_undo(args) -> int:
                 # re-check right before touching the file: something may have written it since planning
                 if not args.force and disk_state(full) != st["expected"]:
                     print("    SKIPPED         %s (changed while undoing; --force overwrites it)" % rel)
+                    blocked.add(st["rel"])
                     failed += 1
                     incomplete.add(e["id"])
                     continue
@@ -254,11 +275,12 @@ def cmd_undo(args) -> int:
                         data = store.load_blob(st["pre"][1])
                         if data is None:
                             raise OSError("previous content is no longer stored")
-                        write_file(store, st["rel"], st["pre"][0], data)
+                        write_file(store, st["rel"], st["pre"][0], data, st.get("perm"))
                     done += 1
                     print("    %-15s %s %s" % (label, rel, note[st["action"]]))
                 except OSError as ex:
                     print("    FAILED          %s: %s" % (rel, ex))
+                    blocked.add(st["rel"])
                     failed += 1
                     incomplete.add(e["id"])
         if not args.dry_run:
