@@ -27,7 +27,8 @@ DEFAULTS = {
     "plugin_dirs": [],
     # Limits.
     "max_files": 100000,          # tracked + untracked files in the worktree
-    "max_file_bytes": 20 * 1024 * 1024,  # bigger untracked files are not snapshotted
+    "max_file_bytes": 20 * 1024 * 1024,  # bigger files are not snapshotted ("too large")
+    "max_untracked": 5000,        # first snapshot: more files to hash than this -> switched off
     "first_snapshot_ms": 8000,    # budget for the very first snapshot of a project
     "snapshot_ms": 3000,          # budget for every later snapshot
     "scan_ms": 400,               # budget for the file-count pre-scan of non-git dirs
@@ -55,7 +56,7 @@ DEFAULTS = {
 # A cloned repository must not be able to widen what bash-bridge executes or reads ...
 USER_ONLY = {"project_hooks", "sources", "plugin_dirs", "include_match_all", "follow_rule_symlinks", "excludes"}
 # ... nor raise its resource limits (it may lower them).
-LOWER_ONLY = {"undo_max_bytes", "store_max_bytes", "keep_entries", "undo_days", "max_file_bytes", "max_files",
+LOWER_ONLY = {"max_untracked", "undo_max_bytes", "store_max_bytes", "keep_entries", "undo_days", "max_file_bytes", "max_files",
               "hook_timeout_s", "hook_budget_s", "first_snapshot_ms", "snapshot_ms", "scan_ms",
               "max_bridged_files", "context_chars", "rule_chars"}
 
@@ -69,6 +70,7 @@ _BOOL_ENV = {
 _INT_ENV = {
     "BASH_BRIDGE_MAX_FILES": "max_files",
     "BASH_BRIDGE_MAX_FILE_BYTES": "max_file_bytes",
+    "BASH_BRIDGE_MAX_UNTRACKED": "max_untracked",
     "BASH_BRIDGE_FIRST_SNAPSHOT_MS": "first_snapshot_ms",
     "BASH_BRIDGE_SNAPSHOT_MS": "snapshot_ms",
     "BASH_BRIDGE_HOOK_TIMEOUT_S": "hook_timeout_s",

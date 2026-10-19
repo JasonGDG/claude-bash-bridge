@@ -279,8 +279,10 @@ class Result:
                 self.json = None
 
 
-def run_handler(h: Handler, payload: dict, project_dir: str, cwd: str, timeout_cap: float) -> Result:
+def run_handler(h: Handler, payload: dict, project_dir: str, cwd: str, timeout_cap: float,
+                extra_env=None) -> Result:
     env = dict(os.environ)
+    env.update(extra_env or {})
     env["BASH_BRIDGE_ACTIVE"] = "1"
     env["CLAUDE_PROJECT_DIR"] = project_dir
     if h.plugin_root:
@@ -339,12 +341,12 @@ def run_handler(h: Handler, payload: dict, project_dir: str, cwd: str, timeout_c
         return Result(h, None, "", "", timed_out=True)
 
 
-def run_parallel(handlers, payload, project_dir, cwd, timeout_cap):
+def run_parallel(handlers, payload, project_dir, cwd, timeout_cap, extra_env=None):
     results = [None] * len(handlers)
 
     def work(i, h):
         try:
-            results[i] = run_handler(h, payload, project_dir, cwd, timeout_cap)
+            results[i] = run_handler(h, payload, project_dir, cwd, timeout_cap, extra_env)
         except Exception as e:  # pragma: no cover - defensive
             results[i] = Result(h, None, "", "", error=str(e))
 
@@ -402,3 +404,15 @@ def interpret_pre(r: Result):
         if hso.get("additionalContext"):
             out["context"] = str(hso["additionalContext"])
     return out
+
+
+def run_many(tasks, project_dir, cwd, timeout_cap, extra_env=None, workers: int = 4):
+    """tasks: [(key, handlers, payload)]. Runs the files in parallel (a small pool, each file's
+    handlers in parallel too) and returns [(key, results)] in the order of tasks."""
+    if not tasks:
+        return []
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(tasks)))) as ex:
+        futs = [ex.submit(run_parallel, hs, payload, project_dir, cwd, timeout_cap, extra_env)
+                for _key, hs, payload in tasks]
+        return [(tasks[i][0], f.result()) for i, f in enumerate(futs)]

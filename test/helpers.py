@@ -101,7 +101,7 @@ class BridgeCase(unittest.TestCase):
         return path
 
     def logging_hook(self, matcher="Write|Edit", event="PostToolUse", where="project", extra=None):
-        script = self.hook_script("log-%s.sh" % event, 'cat >> "$HOOK_LOG"; echo >> "$HOOK_LOG"\n')
+        script = self.hook_script("log-%s.sh" % event, 'd=$(cat); printf "%s\\n" "$d" >> "$HOOK_LOG"\n')
         h = {"type": "command", "command": script}
         if extra:
             h.update(extra)

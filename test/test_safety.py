@@ -1,4 +1,5 @@
 """A hook must never break the session: exit 0 and an empty stdout on any internal error."""
+import json
 import os
 import stat
 
@@ -32,9 +33,14 @@ class Safety(BridgeCase):
         self.assertEqual(len(self.entries()), 1)
 
     def test_missing_git(self):
+        """No git: exit 0, and Claude gets a one-time note instead of silence."""
         env = dict(self.env, PATH="/nonexistent-dir")
         self.assert_silent("pre", env=env)
-        self.assert_silent("post", env=env)
+        code, out, _e, _t = self.run_hook("post", self.event("post", "echo x > a.txt", "t1"), env)
+        self.assertEqual(code, 0)
+        self.assertIn("git is not installed", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        self.assert_silent("pre", self.event("pre", "echo y > a.txt", "t2"), env=env)
+        self.assert_silent("post", self.event("post", "echo y > a.txt", "t2"), env=env)
 
     def test_unwritable_state_dir(self):
         ro = os.path.join(self.tmp, "ro")
@@ -54,7 +60,12 @@ class Safety(BridgeCase):
         with open(os.path.join(projects, key, "shadow.git", "index"), "wb") as fh:
             fh.write(b"garbage")
         self.assert_silent("pre")
-        self.assert_silent("post")
+        code, out, _e, _t = self.run_hook("post", self.event("post", "echo x > a.txt", "t1"))
+        self.assertEqual(code, 0)
+        self.assertIn("could not take a snapshot", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        # the broken shadow repo is rebuilt on the next call
+        self.bash("echo 2 > a.txt")
+        self.assertEqual(len(self.entries()), 2)
 
     def test_disable_env(self):
         env = dict(self.env, BASH_BRIDGE_DISABLE="1")

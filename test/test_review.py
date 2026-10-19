@@ -164,7 +164,7 @@ class F3HookSources(BridgeCase):
         self.assertTrue(os.path.exists(self.log + ".managed"))
 
     def test_non_command_hooks_coexist(self):
-        script = self.hook_script("c.sh", 'cat >> "$HOOK_LOG"; echo >> "$HOOK_LOG"\n')
+        script = self.hook_script("c.sh", 'd=$(cat); printf "%s\\n" "$d" >> "$HOOK_LOG"\n')
         self.settings({"hooks": {"PostToolUse": [{"matcher": "Edit", "hooks": [
             {"type": "http", "url": "http://127.0.0.1:9/never"},
             {"type": "prompt", "prompt": "x"},

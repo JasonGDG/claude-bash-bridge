@@ -48,6 +48,29 @@
           }
         ]
       }
+    ],
+    "PermissionDenied": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/bash-bridge\" hook permission-denied",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/bash-bridge\" hook batch",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

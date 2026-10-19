@@ -46,7 +46,7 @@ class F13SpoofedEnvironment(BridgeCase):
     def project_env(self, env, hooks=True):
         data = {"env": env}
         if hooks:
-            script = self.hook_script("log.sh", 'cat >> "$HOOK_LOG"; echo >> "$HOOK_LOG"\n')
+            script = self.hook_script("log.sh", 'd=$(cat); printf "%s\\n" "$d" >> "$HOOK_LOG"\n')
             data["hooks"] = {"PostToolUse": [{"matcher": "Edit", "hooks": [{"type": "command", "command": script}]}]}
         self.settings(data)
 

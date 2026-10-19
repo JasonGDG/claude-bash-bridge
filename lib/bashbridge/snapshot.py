@@ -211,12 +211,21 @@ class Store:
             return meta.get("disabled_reason") or "disabled"
         return None
 
+    def reset(self) -> None:
+        meta = self.meta()
+        meta["ready"] = False
+        self.save_meta(meta)
+        shutil.rmtree(self.gitdir, ignore_errors=True)
+
     def disable(self, reason: str, hours: float = 24.0) -> None:
         meta = self.meta()
         meta["disabled_until"] = time.time() + hours * 3600
         meta["disabled_reason"] = reason
         meta["worktree"] = self.worktree
+        meta["ready"] = False
         self.save_meta(meta)
+        # free the space: a half-built shadow repo is useless while disabled
+        shutil.rmtree(self.gitdir, ignore_errors=True)
         debug("disabled %s: %s" % (self.worktree, reason))
 
     def _real_gitdir(self):
@@ -333,7 +342,7 @@ class Store:
                     lines += [l.rstrip("\n") for l in fh]
             except OSError:
                 pass
-        for rel in list(meta.get("big_files", [])) + list(extra):
+        for rel in list(extra):
             lines.append("/" + re.sub(r"([\\*?\[\]!#])", r"\\\1", rel))
         with open(os.path.join(info, "exclude"), "w", encoding="utf-8", errors="surrogateescape") as fh:
             fh.write("\n".join(lines) + "\n")
@@ -358,7 +367,9 @@ class Store:
                 self.disable("%d tracked files exceed max_files=%d" % (n, max_files), hours=24 * 7)
                 raise Disabled(self.meta()["disabled_reason"])
         else:
-            n = self._count_files(cfg, int(cfg.get("scan_ms", 400)))
+            n = self._count_files(dict(cfg, max_files=min(int(cfg.get("max_files", 100000)),
+                                                          int(cfg.get("max_untracked", 5000)))),
+                                  int(cfg.get("scan_ms", 400)))
             if n is None:
                 self.disable("more than max_files=%d files (or the scan took over %d ms)"
                              % (max_files, int(cfg.get("scan_ms", 400))), hours=24)
@@ -369,7 +380,8 @@ class Store:
         for k, v in (("core.bare", "false"), ("core.autocrlf", "false"), ("core.safecrlf", "false"),
                      ("core.fsmonitor", "false"), ("core.untrackedCache", "false"), ("core.quotepath", "false"),
                      ("core.splitIndex", "false"), ("gc.auto", "0"), ("advice.addEmbeddedRepo", "false"),
-                     ("core.precomposeunicode", "true"), ("index.skipHash", "false")):
+                     ("core.precomposeunicode", "true"), ("index.skipHash", "false"),
+                     ("core.looseCompression", "1")):
             run_git(["--git-dir", self.gitdir, "config", k, v], timeout=5.0)
         meta = {"worktree": self.worktree, "created": time.time(), "is_git": is_git, "big_files": []}
         seeded = False
@@ -425,34 +437,46 @@ class Store:
             raise
         paths = []
         seen = set()
-        big = []
+        self.big, self.unreadable = {}, []
+        untracked = 0
         for raw in out.split(b"\0"):
             if not raw or raw.endswith(b"/") or raw in seen:
                 continue  # nested repositories show up as "dir/"
             seen.add(raw)
-            full = os.path.join(self.worktree, os.fsdecode(raw))
+            rel = os.fsdecode(raw)
+            full = os.path.join(self.worktree, rel)
             try:
                 st = os.lstat(full)
-                if st.st_size > max_bytes and not os.path.islink(full):
-                    big.append(os.fsdecode(raw))
-                    continue
+                if not os.path.islink(full):
+                    if st.st_size > max_bytes:
+                        # re-evaluated on every snapshot; kept out of the shadow index meanwhile
+                        self.big[rel] = [st.st_size, st.st_mtime_ns]
+                        continue
+                    if os.path.isfile(full) and not os.access(full, os.R_OK):
+                        self.unreadable.append(rel)
+                        continue
+                untracked += 1
             except OSError:
                 pass  # deleted: update-index --remove handles it
             paths.append(raw)
-        if len(paths) > max_files:
-            self.disable("%d changed/untracked files exceed max_files=%d" % (len(paths), max_files), hours=24)
+        max_untracked = int(cfg.get("max_untracked", 5000))
+        if first and untracked > max_untracked and self.meta().get("is_git"):
+            # unseeded git projects list tracked files too; count only what git itself calls untracked
+            try:
+                real = run_git(["-C", self.worktree, "ls-files", "-o", "-z", "--exclude-standard"], timeout=budget)
+                untracked = len([r for r in real.split(b"\0") if r and not r.endswith(b"/")])
+            except SnapshotError:
+                pass
+        if first and untracked > max_untracked:
+            self.disable("%d files to snapshot (not ignored by .gitignore) exceed max_untracked=%d"
+                         % (untracked, max_untracked), hours=24 * 7)
             raise Disabled(self.meta()["disabled_reason"])
-        if big:
-            meta = self.meta()
-            known = set(meta.get("big_files", []))
-            new = [b for b in big if b not in known]
-            if new:
-                meta["big_files"] = sorted(known.union(new))[-5000:]
-                self.save_meta(meta)
-                self.write_excludes(cfg)
-            # drop already-tracked big files from the shadow index so they stay out
+        if len(paths) > max_files:
+            self.disable("%d changed/untracked files exceed max_files=%d" % (len(paths), max_files), hours=24 * 7)
+            raise Disabled(self.meta()["disabled_reason"])
+        if self.big:
             self.git(["update-index", "-z", "--force-remove", "--stdin"],
-                     input_bytes=b"\0".join(os.fsencode(b) for b in big) + b"\0", timeout=budget, check=False)
+                     input_bytes=b"\0".join(os.fsencode(b) for b in self.big) + b"\0", timeout=budget, check=False)
         remaining = max(1.0, budget - (time.time() - start))
         if paths:
             try:
@@ -462,8 +486,10 @@ class Store:
                 if "timed out" in str(e):
                     self.disable("hashing changed files took longer than %d ms" % int(budget * 1000), hours=6)
                     raise Disabled(self.meta()["disabled_reason"])
-                debug("update-index failed (%s); falling back to add -A" % e)
-                self.git(["add", "-A", "--ignore-errors", "--", "."], timeout=remaining, check=False)
+                debug("update-index failed (%s); retrying path by path" % e)
+                for raw in paths[:2000]:
+                    self.git(["update-index", "-z", "--add", "--remove", "--replace", "--stdin"],
+                             input_bytes=raw + b"\0", timeout=remaining, check=False)
         tree = self.git(["write-tree"], timeout=max(1.0, budget)).decode().strip()
         elapsed = time.time() - start
         debug("snapshot %s in %d ms (%d paths)" % (tree[:10], elapsed * 1000, len(paths)))
@@ -526,19 +552,46 @@ class Store:
             pass
         return data
 
-    def fresh_pending(self, exclude: str, max_age_s: float = 600):
-        """Other calls that took a pre-snapshot in the last max_age_s and have not finished."""
+    def fresh_pending(self, exclude: str, session: str = "", agent: str = "", max_age_s: float = 120):
+        """Other calls in this project that took a pre-snapshot and are not finished.
+        Pending entries of calls that never ran (denied) are removed by the PermissionDenied and
+        PostToolBatch hooks; the short window only matters on Claude Code versions without them."""
         from .util import safe_id
         res = []
         mine = safe_id(exclude) + ".json"
         try:
-            for name in os.listdir(self.pending_dir):
-                p = os.path.join(self.pending_dir, name)
-                if name != mine and name.endswith(".json") and time.time() - os.path.getmtime(p) < max_age_s:
-                    res.append(p)
+            names = os.listdir(self.pending_dir)
         except OSError:
-            pass
+            return res
+        for name in names:
+            p = os.path.join(self.pending_dir, name)
+            try:
+                if name == mine or not name.endswith(".json") or time.time() - os.path.getmtime(p) > max_age_s:
+                    continue
+            except OSError:
+                continue
+            data = read_json(p, None)
+            if not isinstance(data, dict) or data.get("disabled"):
+                continue
+            res.append(p)
         return res
+
+    def drop_pending_of(self, session: str, agent: str) -> int:
+        n = 0
+        try:
+            names = os.listdir(self.pending_dir)
+        except OSError:
+            return 0
+        for name in names:
+            p = os.path.join(self.pending_dir, name)
+            data = read_json(p, None)
+            if isinstance(data, dict) and data.get("session") == session and (data.get("agent") or "") == agent:
+                try:
+                    os.remove(p)
+                    n += 1
+                except OSError:
+                    pass
+        return n
 
     def mark_overlap(self, path: str) -> None:
         data = read_json(path, None)

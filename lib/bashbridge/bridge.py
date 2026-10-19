@@ -7,7 +7,7 @@ import time
 from . import __version__
 from . import config as config_mod
 from .classify import invokes_bash_bridge, is_plain_single_view, is_read_only, read_targets
-from .hooks import collect, if_matches, interpret_post, interpret_pre, run_parallel, select_for_tool, settings_files
+from .hooks import collect, if_matches, interpret_post, interpret_pre, run_many, select_for_tool, settings_files
 from .rules import RuleSet, build_context, claude_md_excludes, loaded_in_transcript
 from .snapshot import Disabled, SnapshotError, Store, disk_state, find_git_toplevel, remove_path, write_blob_to
 from .util import debug, is_within, read_json, safe_id, state_dir, truncate, write_json_atomic
@@ -146,12 +146,18 @@ def payload_for(event, hook_event, tool, ti, tr, n, word, cmd):
     p["tool_use_id"] = "%s-bash-bridge-%d" % (event.get("tool_use_id") or "toolu", n)
     if hook_event == "PostToolUse":
         p["duration_ms"] = int(event.get("duration_ms") or 0)
-    p["bash_bridge"] = {"synthetic": True, "version": __version__, "source_tool": "Bash", "change": word,
-                        "command": truncate(cmd or "", 2000)}
+    # The Bash command itself is NOT in the event: guards that text-match the payload would
+    # otherwise fire for every file of a command that merely mentions a protected name.
+    # Hooks that want it read $BASH_BRIDGE_COMMAND.
+    p["bash_bridge"] = {"synthetic": True, "version": __version__, "source_tool": "Bash", "change": word}
     return p
 
 
 # --------------------------------------------------------------------------- handlers
+def _caller(event):
+    return event.get("session_id") or "nosession", event.get("agent_id") or ""
+
+
 def handle_pre(event, cfg):
     ti = event.get("tool_input") or {}
     cmd = ti.get("command") or ""
@@ -164,6 +170,8 @@ def handle_pre(event, cfg):
     project_dir, worktree = resolve(event)
     store = Store(worktree)
     tuid = event.get("tool_use_id") or "unknown"
+    sid, agent = _caller(event)
+    base = {"ts": time.time(), "project_dir": project_dir, "session": sid, "agent": agent}
     t0 = time.time()
     try:
         with store.lock(timeout=5.0):
@@ -172,21 +180,79 @@ def handle_pre(event, cfg):
             tree = store.snapshot(cfg, first=first)
             # another Bash call between its pre and post in this project? then neither call
             # can tell which changes are its own
-            others = store.fresh_pending(exclude=tuid)
+            others = store.fresh_pending(tuid, sid, agent)
             for o in others:
                 store.mark_overlap(o)
-            store.save_pending(tuid, {"tree": tree, "ts": time.time(), "project_dir": project_dir,
-                                      "overlap": bool(others)})
+            store.save_pending(tuid, dict(base, tree=tree, big=store.big, unreadable=store.unreadable,
+                                          overlap=bool(others)))
     except Disabled as e:
-        store.save_pending(tuid, {"disabled": str(e)})
+        store.save_pending(tuid, dict(base, disabled=str(e)))
+        return None
+    except SnapshotError as e:
+        # busy (lock timeout) or git missing: never let the change be silently attributed elsewhere
+        reason = str(e)
+        if "git not found" in reason:
+            store.save_pending(tuid, dict(base, disabled="git is not installed or not on PATH", tell_model=True))
+            return None
+        for o in store.fresh_pending(tuid, sid, agent):
+            store.mark_overlap(o)
+        store.save_pending(tuid, dict(base, ambiguous=reason))
+        if "lock timeout" not in reason:
+            store.reset()  # a broken shadow repo is rebuilt on the next call
+        debug("pre %s: no snapshot (%s)" % (tuid, reason))
         return None
     debug("pre %s: tree %s in %d ms" % (tuid, tree[:10], (time.time() - t0) * 1000))
+    return None
+
+
+def handle_forget(event, cfg):
+    """PermissionDenied: the call will never get a PostToolUse, drop its pending snapshot."""
+    if event.get("tool_name") != "Bash":
+        return None
+    _project_dir, worktree = resolve(event)
+    store = Store(worktree)
+    if os.path.isdir(store.dir):
+        store.pop_pending(event.get("tool_use_id") or "unknown")
+    return None
+
+
+def handle_batch(event, cfg):
+    """PostToolBatch: every call of the batch has resolved. Pending snapshots this session/agent
+    still holds belong to calls that never ran (denied by a rule, a hook or the user)."""
+    _project_dir, worktree = resolve(event)
+    store = Store(worktree)
+    if os.path.isdir(store.dir):
+        sid, agent = _caller(event)
+        store.drop_pending_of(sid, agent)
     return None
 
 
 def _rel(path, project_dir, worktree):
     base = project_dir if is_within(path, project_dir) else worktree
     return os.path.relpath(path, base)
+
+
+def _once(sid, note):
+    sess = load_session(sid)
+    if note in sess["notes"]:
+        return False
+    sess["notes"].append(note)
+    save_session(sid, sess)
+    return True
+
+
+def _classify_big(changes, pre_big, post_big, worktree):
+    """Files over max_file_bytes are kept out of the shadow index; report them as "B" (changed,
+    too large to snapshot) instead of the deleted/created the tree diff would show."""
+    big = set(pre_big) | set(post_big)
+    res = [(st, rel) for st, rel in changes if rel not in big]
+    for rel in sorted(big):
+        if rel in post_big and pre_big.get(rel) == post_big.get(rel):
+            continue  # unchanged big file
+        if rel not in post_big and rel not in pre_big:
+            continue
+        res.append(("B", rel))
+    return res
 
 
 def handle_post(event, cfg, failure=False):
@@ -198,7 +264,7 @@ def handle_post(event, cfg, failure=False):
     project_dir, worktree = resolve(event)
     store = Store(worktree)
     tuid = event.get("tool_use_id") or "unknown"
-    sid = event.get("session_id") or "nosession"
+    sid, agent = _caller(event)
     pending = store.pop_pending(tuid) if os.path.isdir(store.dir) else None
 
     if pending is None:
@@ -206,21 +272,28 @@ def handle_post(event, cfg, failure=False):
             return _read_rules(event, cfg, cmd, project_dir, sid, hook_event)
         return None
     if pending.get("disabled"):
-        sess = load_session(sid)
-        note = "disabled:" + store.worktree
-        if note in sess["notes"]:
+        if not _once(sid, "disabled:" + store.worktree):
             return None
-        sess["notes"].append(note)
-        save_session(sid, sess)
-        return {"systemMessage": "bash-bridge is inactive for %s: %s. Hooks, rules and undo are not "
-                                 "bridged for Bash changes here." % (store.worktree, pending["disabled"])}
+        msg = ("bash-bridge is inactive for %s: %s. Hooks, rules and undo are not bridged for Bash "
+               "changes here." % (store.worktree, pending["disabled"]))
+        out = {"systemMessage": msg}
+        if pending.get("tell_model"):
+            out["hookSpecificOutput"] = {"hookEventName": hook_event, "additionalContext": msg}
+        return out
+    if pending.get("ambiguous"):
+        msg = ("bash-bridge could not take a snapshot before this Bash command (%s), so its file changes are "
+               "not tracked: no Write/Edit hooks, rules or undo for them." % pending["ambiguous"])
+        return {"hookSpecificOutput": {"hookEventName": hook_event, "additionalContext": msg}}
     pre_tree = pending["tree"]
     t0 = time.time()
     try:
         with store.lock(timeout=10.0):
             post_tree = store.snapshot(cfg)
             changes = store.diff(pre_tree, post_tree)
-            overlap = bool(pending.get("overlap")) or bool(store.fresh_pending(exclude=tuid))
+            changes = _classify_big(changes, pending.get("big") or {}, store.big, store.worktree)
+            new_unreadable = sorted(set(store.unreadable) - set(pending.get("unreadable") or []))
+            changes += [("U", rel) for rel in new_unreadable if (("A", rel) not in changes)]
+            overlap = bool(pending.get("overlap")) or bool(store.fresh_pending(tuid, sid, agent))
     except Disabled:
         return None
     if not changes:
@@ -240,7 +313,7 @@ def handle_post(event, cfg, failure=False):
     def abs_of(rel):
         return os.path.join(store.worktree, rel)
 
-    live = [(st, rel) for st, rel in changes if st != "D"]
+    live = [(st, rel) for st, rel in changes if st in ("A", "M", "T") or (st == "B" and os.path.lexists(abs_of(rel)))]
     limit = int(cfg["max_bridged_files"])
     over = max(0, len(live) - limit)
     live = live[:limit]
@@ -249,35 +322,51 @@ def handle_post(event, cfg, failure=False):
     denied, reverted = [], set()
     ran_any = False
     synth_cache = {}
+    cwd = event.get("cwd") or project_dir
+    extra_env = {"BASH_BRIDGE_COMMAND": cmd[:65536]}
 
     def synth(st, rel):
         if rel not in synth_cache:
             try:
-                synth_cache[rel] = synthesize(store, pre_tree, st, rel, abs_of(rel))
+                if st == "B":  # too large: the path only, no content
+                    p = abs_of(rel)
+                    synth_cache[rel] = ("Write", {"file_path": p, "content": ""},
+                                        {"type": "update", "filePath": p, "content": "", "structuredPatch": [],
+                                         "originalFile": None, "userModified": False}, "too large")
+                else:
+                    synth_cache[rel] = synthesize(store, pre_tree, st, rel, abs_of(rel))
             except Exception as e:  # noqa: BLE001 - one odd file must not cost the others
                 debug("synthesize %s failed: %s" % (rel, e))
                 synth_cache[rel] = None
         return synth_cache[rel]
 
     budget_end = time.time() + float(cfg["hook_budget_s"])
-    n = 0
-    # ---- PreToolUse Write|Edit guards, applied after the fact
+    counter = [0]
+
+    def tasks_for(handlers, hook_name, with_response):
+        tasks = []
+        for st, rel in live:
+            if rel in reverted or synth(st, rel) is None:
+                continue
+            tool, tinput, tresp, word = synth(st, rel)
+            hs = [h for h in select_for_tool(handlers, tool, cfg) if if_matches(h.spec.get("if"), tool, abs_of(rel), cwd)]
+            if not hs:
+                continue
+            counter[0] += 1
+            payload = payload_for(event, hook_name, tool, tinput, tresp if with_response else None, counter[0],
+                                  word, cmd)
+            tasks.append(((st, rel, tool), hs, payload))
+        return tasks
+
+    # ---- PreToolUse Write|Edit guards, applied after the fact (files in parallel)
     if cfg["guard"] != "off":
         pre_handlers = collect("PreToolUse", project_dir, cfg)
-        if pre_handlers:
-            for st, rel in live:
-                if synth(st, rel) is None:
-                    continue
-                tool, tinput, _tr, word = synth(st, rel)
-                hs = [h for h in select_for_tool(pre_handlers, tool, cfg)
-                      if if_matches(h.spec.get("if"), tool, abs_of(rel), event.get("cwd") or project_dir)]
-                if not hs or time.time() > budget_end:
-                    continue
-                n += 1
-                ran_any = True
-                payload = payload_for(event, "PreToolUse", tool, tinput, None, n, word, cmd)
-                cap = min(float(cfg["hook_timeout_s"]), max(1.0, budget_end - time.time()))
-                for r in run_parallel(hs, payload, project_dir, event.get("cwd") or project_dir, cap):
+        tasks = tasks_for(pre_handlers, "PreToolUse", False) if pre_handlers else []
+        if tasks:
+            ran_any = True
+            cap = min(float(cfg["hook_timeout_s"]), max(1.0, budget_end - time.time()))
+            for (st, rel, tool), results in run_many(tasks, project_dir, cwd, cap, extra_env):
+                for r in results:
                     ip = interpret_pre(r)
                     if ip["deny"]:
                         denied.append((st, rel, tool, r.handler.label(), ip["deny"]))
@@ -286,61 +375,56 @@ def handle_post(event, cfg, failure=False):
                                         % (r.handler.label(), tool, rel, ip["ask"]))
                     if ip["context"]:
                         contexts.append(ip["context"])
-            conflicts = set()
-            if denied and cfg["guard"] == "revert":
-                with store.lock(timeout=10.0):
-                    for st, rel, _tool, _label, _reason in denied:
-                        try:
-                            # only roll back what this command wrote: if the file changed again since
-                            # the post-snapshot (another call, a formatter, the user), leave it alone
-                            post_info = store.entry_info(post_tree, rel)
-                            if overlap or disk_state(abs_of(rel)) != (tuple(post_info) if post_info else None):
-                                conflicts.add(rel)
-                                continue
-                            if st == "A":
-                                remove_path(store, rel)
-                            else:
-                                write_blob_to(store, pre_tree, rel)
-                            reverted.add(rel)
-                        except Exception as e:  # noqa: BLE001
-                            debug("revert %s failed: %s" % (rel, e))
-            for st, rel, tool, label, reason in denied:
-                if rel in reverted:
-                    action = "bash-bridge restored the file to its state before the Bash command"
-                elif rel in conflicts and overlap:
-                    action = ("another Bash call ran in this project at the same time, so the change may not be "
-                              "this command's; bash-bridge did NOT roll it back, the change is still on disk")
-                elif rel in conflicts:
-                    action = ("the file changed again after the Bash command, so bash-bridge did NOT roll it "
-                              "back; the change is still on disk")
-                else:
-                    action = "the change is still on disk"
-                blocks.append("PreToolUse hook %s denies %s of %s: %s (%s)." % (label, tool, rel, reason, action))
+        conflicts = set()
+        if denied and cfg["guard"] == "revert":
+            with store.lock(timeout=10.0):
+                for st, rel, _tool, _label, _reason in denied:
+                    try:
+                        # only roll back what this command wrote: if the file changed again since the
+                        # post-snapshot (another call, a formatter, the user), or another call overlapped,
+                        # leave it alone
+                        post_info = store.entry_info(post_tree, rel)
+                        if st == "B" or overlap or \
+                                disk_state(abs_of(rel)) != (tuple(post_info) if post_info else None):
+                            conflicts.add(rel)
+                            continue
+                        if st == "A":
+                            remove_path(store, rel)
+                        else:
+                            write_blob_to(store, pre_tree, rel)
+                        reverted.add(rel)
+                    except Exception as e:  # noqa: BLE001
+                        debug("revert %s failed: %s" % (rel, e))
+        for st, rel, tool, label, reason in denied:
+            if rel in reverted:
+                action = "bash-bridge restored the file to its state before the Bash command"
+            elif rel in conflicts and st == "B":
+                action = "the file is too large to snapshot, so bash-bridge could not roll it back"
+            elif rel in conflicts and overlap:
+                action = ("another Bash call ran in this project at the same time, so the change may not be "
+                          "this command's; bash-bridge did NOT roll it back, the change is still on disk")
+            elif rel in conflicts:
+                action = ("the file changed again after the Bash command, so bash-bridge did NOT roll it "
+                          "back; the change is still on disk")
+            else:
+                action = "the change is still on disk"
+            blocks.append("PreToolUse hook %s denies %s of %s: %s (%s)." % (label, tool, rel, reason, action))
 
-    # ---- PostToolUse Write|Edit hooks
+    # ---- PostToolUse Write|Edit hooks (files in parallel)
     if cfg["hooks"]:
         post_handlers = collect("PostToolUse", project_dir, cfg)
-        if post_handlers:
-            for st, rel in live:
-                if rel in reverted or synth(st, rel) is None:
-                    continue
-                tool, tinput, tresp, word = synth(st, rel)
-                hs = [h for h in select_for_tool(post_handlers, tool, cfg)
-                      if if_matches(h.spec.get("if"), tool, abs_of(rel), event.get("cwd") or project_dir)]
-                if not hs:
-                    continue
-                if time.time() > budget_end:
-                    systems.append("bash-bridge: hook budget used up; hooks skipped for %s" % rel)
-                    continue
-                n += 1
-                ran_any = True
-                payload = payload_for(event, "PostToolUse", tool, tinput, tresp, n, word, cmd)
-                cap = min(float(cfg["hook_timeout_s"]), max(1.0, budget_end - time.time()))
-                for r in run_parallel(hs, payload, project_dir, event.get("cwd") or project_dir, cap):
+        tasks = tasks_for(post_handlers, "PostToolUse", True) if post_handlers else []
+        if tasks and time.time() > budget_end:
+            systems.append("bash-bridge: hook budget used up; PostToolUse hooks skipped")
+            tasks = []
+        if tasks:
+            ran_any = True
+            cap = min(float(cfg["hook_timeout_s"]), max(1.0, budget_end - time.time()))
+            for (st, rel, tool), results in run_many(tasks, project_dir, cwd, cap, extra_env):
+                for r in results:
                     ip = interpret_post(r)
                     lab = r.handler.label()
                     if r.timed_out:
-                        debug("hook timed out: %s" % lab)
                         systems.append("bash-bridge: hook %s timed out on %s" % (lab, rel))
                     if ip["block"]:
                         blocks.append("PostToolUse hook %s (run by bash-bridge for the %s of %s): %s"
@@ -359,7 +443,8 @@ def handle_post(event, cfg, failure=False):
             with store.lock(timeout=10.0):
                 t3 = store.snapshot(cfg)
                 entry["post"] = t3
-                entry["changes"] = store.diff(pre_tree, t3) or changes
+                fresh = _classify_big(store.diff(pre_tree, t3), pending.get("big") or {}, store.big, store.worktree)
+                entry["changes"] = (fresh + [c for c in changes if c[0] == "U"]) or changes
                 store.record_files(entry, cfg)
                 store.update_entry(entry)
         except (Disabled, SnapshotError) as e:
@@ -523,4 +608,8 @@ def dispatch(mode, event):
         return handle_post(event, cfg, failure=True)
     if mode == "session-start":
         return handle_session_start(event, cfg)
+    if mode == "permission-denied":
+        return handle_forget(event, cfg)
+    if mode == "batch":
+        return handle_batch(event, cfg)
     return None
