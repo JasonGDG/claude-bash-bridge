@@ -9,7 +9,7 @@ from . import config as config_mod
 from .classify import invokes_bash_bridge, is_plain_single_view, is_read_only, read_targets
 from .hooks import collect, if_matches, interpret_post, interpret_pre, run_parallel, select_for_tool, settings_files
 from .rules import RuleSet, build_context, claude_md_excludes, loaded_in_transcript
-from .snapshot import Disabled, SnapshotError, Store, find_git_toplevel, remove_path, write_blob_to
+from .snapshot import Disabled, SnapshotError, Store, disk_state, find_git_toplevel, remove_path, write_blob_to
 from .util import debug, is_within, read_json, safe_id, state_dir, truncate, write_json_atomic
 
 TEXT_CAP = 256 * 1024
@@ -83,6 +83,24 @@ def edit_strings(old: str, new: str):
     return "".join(a[lo:hi_a]), "".join(b[lo:hi_b])
 
 
+def structured_patch(old: str, new: str, limit: int = 2000):
+    """Hunks in the shape Claude Code's Edit/Write tool_response uses."""
+    import difflib
+    a, b = old.splitlines(), new.splitlines()
+    hunks = []
+    for group in difflib.SequenceMatcher(None, a, b, autojunk=False).get_grouped_opcodes(3):
+        i1, i2, j1, j2 = group[0][1], group[-1][2], group[0][3], group[-1][4]
+        lines = []
+        for tag, a1, a2, b1, b2 in group:
+            if tag == "equal":
+                lines += [" " + x for x in a[a1:a2]]
+            else:
+                lines += ["-" + x for x in a[a1:a2]] + ["+" + x for x in b[b1:b2]]
+        hunks.append({"oldStart": i1 + 1, "oldLines": i2 - i1, "newStart": j1 + 1, "newLines": j2 - j1,
+                      "lines": lines[:limit]})
+    return hunks
+
+
 def synthesize(store, pre_tree, status, rel, abs_path):
     """-> (tool_name, tool_input, tool_response, change_word)"""
     new_bytes = _read_file(abs_path)
@@ -97,13 +115,18 @@ def synthesize(store, pre_tree, status, rel, abs_path):
         o, n = edit_strings(old_text, new_text)
         if len(o) <= 100000 and len(n) <= 100000:
             ti = {"file_path": abs_path, "old_string": o, "new_string": n, "replace_all": False}
-            tr = {"filePath": abs_path, "oldString": o, "newString": n, "originalFile": None,
-                  "structuredPatch": [], "userModified": False, "replaceAll": False}
+            small = len(old_text) <= TEXT_CAP and len(new_text) <= TEXT_CAP
+            tr = {"filePath": abs_path, "oldString": o, "newString": n,
+                  "originalFile": old_text if small else None,
+                  "structuredPatch": structured_patch(old_text, new_text) if small else [],
+                  "userModified": False, "replaceAll": False}
             return "Edit", ti, tr, word
     content = new_text if (new_text is not None and len(new_text) <= TEXT_CAP) else ""
     ti = {"file_path": abs_path, "content": content}
+    orig = old_text if (old_text is not None and len(old_text) <= TEXT_CAP) else None
     tr = {"type": "create" if status == "A" else "update", "filePath": abs_path, "content": content,
-          "structuredPatch": []}
+          "structuredPatch": structured_patch(orig, content) if (orig is not None and content) else [],
+          "originalFile": orig, "userModified": False}
     return "Write", ti, tr, word
 
 
@@ -119,6 +142,8 @@ def payload_for(event, hook_event, tool, ti, tr, n, word, cmd):
     if tr is not None:
         p["tool_response"] = tr
     p["tool_use_id"] = "%s-bash-bridge-%d" % (event.get("tool_use_id") or "toolu", n)
+    if hook_event == "PostToolUse":
+        p["duration_ms"] = int(event.get("duration_ms") or 0)
     p["bash_bridge"] = {"synthetic": True, "version": __version__, "source_tool": "Bash", "change": word,
                         "command": truncate(cmd or "", 2000)}
     return p
@@ -198,7 +223,8 @@ def handle_post(event, cfg, failure=False):
              "pre": pre_tree, "post": post_tree, "changes": changes, "project_dir": project_dir}
     if cfg["undo"]:
         with store.lock(timeout=10.0):
-            entry = store.add_entry(entry, int(cfg["keep_entries"]))
+            store.record_files(entry, cfg)
+            entry = store.add_entry(entry, int(cfg["keep_entries"]), float(cfg["undo_days"]))
 
     def abs_of(rel):
         return os.path.join(store.worktree, rel)
@@ -249,10 +275,17 @@ def handle_post(event, cfg, failure=False):
                                         % (r.handler.label(), tool, rel, ip["ask"]))
                     if ip["context"]:
                         contexts.append(ip["context"])
+            conflicts = set()
             if denied and cfg["guard"] == "revert":
                 with store.lock(timeout=10.0):
                     for st, rel, _tool, _label, _reason in denied:
                         try:
+                            # only roll back what this command wrote: if the file changed again since
+                            # the post-snapshot (another call, a formatter, the user), leave it alone
+                            post_info = store.entry_info(post_tree, rel)
+                            if disk_state(abs_of(rel)) != (tuple(post_info) if post_info else None):
+                                conflicts.add(rel)
+                                continue
                             if st == "A":
                                 remove_path(store, rel)
                             else:
@@ -261,8 +294,13 @@ def handle_post(event, cfg, failure=False):
                         except Exception as e:  # noqa: BLE001
                             debug("revert %s failed: %s" % (rel, e))
             for st, rel, tool, label, reason in denied:
-                action = ("bash-bridge restored the file to its state before the Bash command"
-                          if rel in reverted else "the change is still on disk")
+                if rel in reverted:
+                    action = "bash-bridge restored the file to its state before the Bash command"
+                elif rel in conflicts:
+                    action = ("the file changed again after the Bash command, so bash-bridge did NOT roll it "
+                              "back; the change is still on disk")
+                else:
+                    action = "the change is still on disk"
                 blocks.append("PreToolUse hook %s denies %s of %s: %s (%s)." % (label, tool, rel, reason, action))
 
     # ---- PostToolUse Write|Edit hooks
@@ -308,6 +346,7 @@ def handle_post(event, cfg, failure=False):
                 t3 = store.snapshot(cfg)
                 entry["post"] = t3
                 entry["changes"] = store.diff(pre_tree, t3) or changes
+                store.record_files(entry, cfg)
                 store.update_entry(entry)
         except (Disabled, SnapshotError) as e:
             debug("re-snapshot failed: %s" % e)
@@ -460,6 +499,8 @@ def dispatch(mode, event):
     cfg = config_mod.load(project_dir)
     if not cfg["enabled"]:
         return None
+    from .util import secure_state
+    secure_state()  # raises on a symlinked / foreign state dir: then bash-bridge does nothing
     if mode == "pre":
         return handle_pre(event, cfg)
     if mode == "post":

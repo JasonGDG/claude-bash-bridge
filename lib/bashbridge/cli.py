@@ -90,6 +90,8 @@ def cmd_list(args) -> int:
     print("bash-bridge: Bash calls that changed files in %s (newest last)" % store.worktree)
     for e in entries:
         flag = " [undone]" if e.get("undone") else ""
+        if e.get("files") is None or any(not f.get("kept", True) for f in e.get("files") or []):
+            flag += " [expired: cannot be undone fully]"
         print("#%-4s %s  %s%s" % (e.get("id"), _fmt_time(e.get("ts")), _one_line(e.get("command")), flag))
         for st, rel in e.get("changes", [])[:20]:
             print("        %-9s %s" % (WORD.get(st, st), rel))
@@ -98,89 +100,115 @@ def cmd_list(args) -> int:
     return 0
 
 
+def _files_of(e):
+    """Per-path pre/post states of an entry. Entries written before pre-images were kept have none."""
+    return e.get("files")
+
+
 def plan_undo(store, entries, force=False):
-    """Compute what undoing `entries` (newest first) does. Returns list of step dicts."""
+    """Compute what undoing `entries` (newest first) does. Returns list of step dicts.
+    Must be called with the store lock held."""
     from .snapshot import disk_state
     virtual = {}
     steps = []
     for e in entries:
-        for st, rel in e.get("changes", []):
-            pre = store.entry_info(e["pre"], rel)
-            post = store.entry_info(e["post"], rel)
+        files = _files_of(e)
+        if files is None:
+            steps.append({"entry": e["id"], "rel": "(all files)", "action": "expired", "conflict": False,
+                          "expected": None, "pre": None})
+            continue
+        for f in files:
+            rel = f["rel"]
+            pre = tuple(f["pre"]) if f.get("pre") else None
+            post = tuple(f["post"]) if f.get("post") else None
             full = os.path.join(store.worktree, rel)
             current = virtual[rel] if rel in virtual else disk_state(full)
-            expected = tuple(post) if post else None
-            conflict = current != expected
+            conflict = current != post
             if pre and post:
                 action = "restore"
             elif pre:
                 action = "recreate"
             else:
                 action = "remove"
-            if pre and current == tuple(pre):
-                action = "unchanged"
-                conflict = False
+            if pre and current == pre:
+                action, conflict = "unchanged", False
+            elif pre and (not f.get("kept", True) or store.load_blob(pre[1]) is None):
+                action = "expired"
             steps.append({"entry": e["id"], "rel": rel, "action": action, "conflict": conflict,
-                          "pre_tree": e["pre"], "status": st})
-            if not conflict or force:
-                virtual[rel] = tuple(pre) if pre else None
+                          "expected": current if rel in virtual else post, "pre": pre})
+            if action != "expired" and (not conflict or force):
+                virtual[rel] = pre
     return steps
 
 
 def cmd_undo(args) -> int:
-    from .snapshot import remove_path, write_blob_to
+    from .snapshot import disk_state, remove_path, write_file
     store = _store_for(args.project)
-    entries = [e for e in store.load_entries() if not e.get("undone")]
-    if args.session:
-        entries = [e for e in entries if e.get("session") == args.session]
-    if args.id is not None:
-        entries = [e for e in entries if e.get("id") == args.id]
-    else:
-        entries = entries[-max(1, args.n):]
-    entries = list(reversed(entries))
-    if not entries:
-        print("bash-bridge: nothing to undo in %s" % store.worktree)
-        return 1
-    steps = plan_undo(store, entries, args.force)
-    if args.dry_run:
-        print("bash-bridge DRY RUN (nothing changed yet): undo the last %d Bash call(s) in %s"
-              % (len(entries), store.worktree))
-    else:
-        print("bash-bridge UNDO: undoing the last %d Bash call(s) in %s" % (len(entries), store.worktree))
     past = {"restore": "restored", "recreate": "recreated", "remove": "removed", "unchanged": "kept"}
     future = {"restore": "would restore", "recreate": "would recreate", "remove": "would remove",
               "unchanged": "would keep"}
     note = {"restore": "(the Bash call modified it)", "recreate": "(the Bash call deleted it)",
             "remove": "(the Bash call created it)", "unchanged": "(already back at the old content)"}
-    by_entry = {}
-    for s in steps:
-        by_entry.setdefault(s["entry"], []).append(s)
-    failed = 0
-    done = 0
+    failed = done = 0
     incomplete = set()
     with store.lock(timeout=10.0):
+        entries = [e for e in store.load_entries() if not e.get("undone")]
+        if args.session:
+            entries = [e for e in entries if e.get("session") == args.session]
+        if args.id is not None:
+            entries = [e for e in entries if e.get("id") == args.id]
+        else:
+            entries = entries[-max(1, args.n):]
+        entries = list(reversed(entries))
+        if not entries:
+            print("bash-bridge: nothing to undo in %s" % store.worktree)
+            return 1
+        steps = plan_undo(store, entries, args.force)
+        if args.dry_run:
+            print("bash-bridge DRY RUN (nothing changed yet): undo the last %d Bash call(s) in %s"
+                  % (len(entries), store.worktree))
+        else:
+            print("bash-bridge UNDO: undoing the last %d Bash call(s) in %s" % (len(entries), store.worktree))
+        by_entry = {}
+        for st in steps:
+            by_entry.setdefault(st["entry"], []).append(st)
         for e in entries:
             print("Bash call id %s at %s: %s" % (e["id"], _fmt_time(e.get("ts")), _one_line(e.get("command"))))
-            for s in by_entry.get(e["id"], []):
-                if s["conflict"] and not args.force:
-                    print("    SKIPPED         %s (changed again after that Bash call; --force overwrites it)"
-                          % s["rel"])
+            for st in by_entry.get(e["id"], []):
+                rel = st["rel"]
+                if st["action"] == "expired":
+                    print("    EXPIRED         %s (its previous content is no longer stored; cannot undo)" % rel)
                     failed += 1
                     incomplete.add(e["id"])
                     continue
-                label = future[s["action"]] if args.dry_run else past[s["action"]]
-                if args.dry_run or s["action"] == "unchanged":
-                    print("    %-15s %s %s" % (label, s["rel"], note[s["action"]]))
+                if st["conflict"] and not args.force:
+                    print("    SKIPPED         %s (changed again after that Bash call; --force overwrites it)" % rel)
+                    failed += 1
+                    incomplete.add(e["id"])
+                    continue
+                label = future[st["action"]] if args.dry_run else past[st["action"]]
+                if args.dry_run or st["action"] == "unchanged":
+                    print("    %-15s %s %s" % (label, rel, note[st["action"]]))
+                    continue
+                full = os.path.join(store.worktree, rel)
+                # re-check right before touching the file: something may have written it since planning
+                if not args.force and disk_state(full) != st["expected"]:
+                    print("    SKIPPED         %s (changed while undoing; --force overwrites it)" % rel)
+                    failed += 1
+                    incomplete.add(e["id"])
                     continue
                 try:
-                    if s["action"] == "remove":
-                        remove_path(store, s["rel"])
+                    if st["action"] == "remove":
+                        remove_path(store, rel)
                     else:
-                        write_blob_to(store, s["pre_tree"], s["rel"])
+                        data = store.load_blob(st["pre"][1])
+                        if data is None:
+                            raise OSError("previous content is no longer stored")
+                        write_file(store, rel, st["pre"][0], data)
                     done += 1
-                    print("    %-15s %s %s" % (label, s["rel"], note[s["action"]]))
+                    print("    %-15s %s %s" % (label, rel, note[st["action"]]))
                 except OSError as ex:
-                    print("    FAILED          %s: %s" % (s["rel"], ex))
+                    print("    FAILED          %s: %s" % (rel, ex))
                     failed += 1
                     incomplete.add(e["id"])
         if not args.dry_run:
@@ -196,7 +224,7 @@ def cmd_undo(args) -> int:
     else:
         print("Done: %d file(s) changed back." % done)
     if failed:
-        print("%d file(s) skipped or failed." % failed)
+        print("%d file(s) skipped, expired or failed." % failed)
     return 0 if not failed else 2
 
 
@@ -238,6 +266,12 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "hook":
         return _hook(argv[1] if len(argv) > 1 else "")
+    from .util import UnsafeState, secure_state
+    try:
+        secure_state()
+    except (UnsafeState, OSError) as e:
+        print("bash-bridge: refusing to use the state directory: %s" % e)
+        return 1
     if argv and argv[0] == "slash":
         try:
             return cmd_slash(argv[1:])
@@ -262,12 +296,17 @@ def main(argv=None) -> int:
     ps = sub.add_parser("status", help="show state and configuration for this project")
     ps.add_argument("--project")
     args = p.parse_args(argv)
-    if args.cmd == "list":
-        return cmd_list(args)
-    if args.cmd == "undo":
-        return cmd_undo(args)
-    if args.cmd == "status":
-        return cmd_status(args)
+    from .util import UnsafeState as _Unsafe
+    try:
+        if args.cmd == "list":
+            return cmd_list(args)
+        if args.cmd == "undo":
+            return cmd_undo(args)
+        if args.cmd == "status":
+            return cmd_status(args)
+    except _Unsafe as e:
+        print("bash-bridge: refusing to use the state directory: %s" % e)
+        return 1
     p.print_help()
     return 0
 

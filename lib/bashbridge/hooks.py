@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 
-from .util import PLUGIN_ROOT, claude_config_dir, debug, read_json
+from .util import PLUGIN_ROOT, claude_config_dir, debug, read_json, restore_umask
 
 EXACT_MATCHER = re.compile(r"^[A-Za-z0-9_\- ,|]*$")
 MANAGED_SETTINGS = "/Library/Application Support/ClaudeCode/managed-settings.json"
@@ -34,10 +34,35 @@ def is_match_all(matcher) -> bool:
     return matcher is None or matcher in ("", "*")
 
 
+def managed_settings_path() -> str:
+    return os.environ.get("BASH_BRIDGE_MANAGED_SETTINGS") or MANAGED_SETTINGS
+
+
+def project_trusted(project_dir: str) -> bool:
+    """True if Claude Code recorded the workspace trust dialog as accepted for project_dir or a parent."""
+    cands = []
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        cands.append(os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".claude.json"))
+    cands.append(os.path.join(os.path.expanduser("~"), ".claude.json"))
+    real = os.path.realpath(project_dir)
+    for path in cands:
+        data = read_json(path, None)
+        projects = data.get("projects") if isinstance(data, dict) else None
+        if not isinstance(projects, dict):
+            continue
+        for p, v in projects.items():
+            if not (isinstance(v, dict) and v.get("hasTrustDialogAccepted") is True):
+                continue
+            rp = os.path.realpath(p)
+            if real == rp or real.startswith(rp.rstrip(os.sep) + os.sep):
+                return True
+    return False
+
+
 def settings_files(project_dir: str, sources):
     files = []
     if "managed" in sources:
-        files.append(("managed", MANAGED_SETTINGS))
+        files.append(("managed", managed_settings_path()))
     if "user" in sources:
         files.append(("user", os.path.join(claude_config_dir(), "settings.json")))
     if project_dir and "project" in sources:
@@ -134,8 +159,16 @@ def collect(event: str, project_dir: str, cfg: dict):
         d = read_json(path, None)
         if isinstance(d, dict):
             data.append((src, d))
+    managed = [d for s, d in data if s == "managed"]
+    if any(d.get("disableAllHooks") is True for d in managed):
+        debug("managed disableAllHooks: no hooks bridged")
+        return []
     disable_all = any(d.get("disableAllHooks") is True for s, d in data if s != "managed")
-    managed_only = any(d.get("allowManagedHooksOnly") is True for s, d in data if s == "managed")
+    managed_only = any(d.get("allowManagedHooksOnly") is True for d in managed)
+    ph = cfg.get("project_hooks", "trusted")
+    allow_project = ph is True or (ph == "trusted" and bool(project_dir) and project_trusted(project_dir))
+    if not allow_project and any(s in ("project", "local") for s, _d in data):
+        debug("project/local hooks not bridged: project not trusted (project_hooks=%s)" % ph)
     handlers, seen = [], set()
 
     def add_map(hmap, source, root=None, pid=None):
@@ -159,9 +192,12 @@ def collect(event: str, project_dir: str, cfg: dict):
     for src, d in data:
         if (disable_all or managed_only) and src != "managed":
             continue
+        if src in ("project", "local") and not allow_project:
+            continue
         add_map(d.get("hooks") or {}, src)
     if "plugins" in sources and not disable_all and not managed_only:
-        for pid, root in enabled_plugins(project_dir, sources, data):
+        plug_data = [(s_, d_) for s_, d_ in data if allow_project or s_ not in ("project", "local")]
+        for pid, root in enabled_plugins(project_dir, sources, plug_data):
             for hmap in _plugin_hook_maps(root):
                 add_map(hmap, "plugin:" + pid.split("@")[0], root, pid)
         for root in cfg.get("plugin_dirs") or []:
@@ -192,7 +228,8 @@ def if_matches(cond, tool: str, file_path: str, cwd: str) -> bool:
         return True
     m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?\s*$", str(cond))
     if not m:
-        return True
+        debug("unsupported `if` condition %r: hook not run" % (cond,))
+        return False
     name, pat = m.group(1), m.group(2)
     if name not in ("Edit", "Write", "MultiEdit", tool):
         return False
@@ -254,9 +291,12 @@ def run_handler(h: Handler, payload: dict, project_dir: str, cwd: str, timeout_c
     if spec.get("shell") == "powershell":
         return Result(h, None, "", "", error="powershell hooks are not bridged")
     if spec.get("args"):
+        # exec form: no shell, placeholders become plain argv strings
         argv = [_subst(str(spec["command"]), env)] + [_subst(str(a), env) for a in spec["args"]]
     else:
-        argv = ["/bin/bash", "-c", _subst(str(spec["command"]), env)]
+        # shell form: leave ${CLAUDE_PLUGIN_ROOT} etc. for bash to expand from the environment, so a
+        # path containing quotes, $() or backticks can never become shell syntax
+        argv = ["/bin/bash", "-c", str(spec["command"])]
     try:
         own = float(spec.get("timeout") or 600)
     except (TypeError, ValueError):
@@ -267,7 +307,7 @@ def run_handler(h: Handler, payload: dict, project_dir: str, cwd: str, timeout_c
     if spec.get("async") or spec.get("asyncRewake"):
         try:
             p = subprocess.Popen(argv, cwd=run_cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
+                                 stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=restore_umask)
             try:
                 p.stdin.write(data)
                 p.stdin.close()
@@ -278,7 +318,7 @@ def run_handler(h: Handler, payload: dict, project_dir: str, cwd: str, timeout_c
             return Result(h, None, "", "", error=str(e))
     try:
         p = subprocess.Popen(argv, cwd=run_cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, start_new_session=True)
+                             stderr=subprocess.PIPE, start_new_session=True, preexec_fn=restore_umask)
     except OSError as e:
         return Result(h, None, "", "", error=str(e))
     try:

@@ -50,6 +50,9 @@ class BridgeCase(unittest.TestCase):
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
             "GIT_COMMITTER_EMAIL": "t@t",
         })
+        # Claude Code records accepted workspace trust here; project hooks are bridged only then
+        with open(os.path.join(self.home, ".claude.json"), "w") as fh:
+            json.dump({"projects": {self.proj: {"hasTrustDialogAccepted": True}}}, fh)
         if self.git:
             sh("git init -q -b main . && git config user.email t@t && git config user.name t", self.proj)
         self.n = 0

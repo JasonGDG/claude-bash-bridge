@@ -37,6 +37,13 @@ DEFAULTS = {
     "context_chars": 9000,        # stay under Claude Code's 10,000-char additionalContext cap
     "rule_chars": 4000,           # per rule / CLAUDE.md file
     "keep_entries": 300,          # undo log entries kept per project
+    "undo_days": 30,              # ...and for at most this many days (pre-images go with them)
+    "undo_max_bytes": 200 * 1024 * 1024,  # pre-images kept per Bash call
+    # Hooks from .claude/settings.json / settings.local.json run only in a project Claude Code
+    # has marked trusted (hasTrustDialogAccepted in ~/.claude.json). true = always, false = never.
+    "project_hooks": "trusted",
+    # Follow symlinks in .claude/rules that point outside the rules folder.
+    "follow_rule_symlinks": False,
     "excludes": [
         "node_modules/", ".venv/", "venv/", "__pycache__/", ".tox/", ".mypy_cache/",
         ".pytest_cache/", ".ruff_cache/", ".next/", ".nuxt/", ".turbo/", ".gradle/",
@@ -44,11 +51,15 @@ DEFAULTS = {
     ],
 }
 
+# A cloned repository must not be able to widen what bash-bridge executes or reads.
+USER_ONLY = {"project_hooks", "sources", "plugin_dirs", "include_match_all", "follow_rule_symlinks"}
+
 _BOOL_ENV = {
     "BASH_BRIDGE_HOOKS": "hooks",
     "BASH_BRIDGE_RULES": "rules",
     "BASH_BRIDGE_UNDO": "undo",
     "BASH_BRIDGE_INCLUDE_MATCH_ALL": "include_match_all",
+    "BASH_BRIDGE_FOLLOW_RULE_SYMLINKS": "follow_rule_symlinks",
 }
 _INT_ENV = {
     "BASH_BRIDGE_MAX_FILES": "max_files",
@@ -68,11 +79,11 @@ def load(project_dir: str | None) -> dict:
     files = [os.path.join(claude_config_dir(), "bash-bridge.json")]
     if project_dir:
         files.append(os.path.join(project_dir, ".claude", "bash-bridge.json"))
-    for path in files:
+    for i, path in enumerate(files):
         data = read_json(path, None)
         if isinstance(data, dict):
             for k, v in data.items():
-                if k in DEFAULTS:
+                if k in DEFAULTS and not (i > 0 and k in USER_ONLY):
                     cfg[k] = v
     env = os.environ
     if _truthy(env.get("BASH_BRIDGE_DISABLE", "")):
@@ -88,6 +99,9 @@ def load(project_dir: str | None) -> dict:
                 pass
     if env.get("BASH_BRIDGE_GUARD"):
         cfg["guard"] = env["BASH_BRIDGE_GUARD"].strip().lower()
+    if env.get("BASH_BRIDGE_PROJECT_HOOKS"):
+        v = env["BASH_BRIDGE_PROJECT_HOOKS"].strip().lower()
+        cfg["project_hooks"] = "trusted" if v == "trusted" else _truthy(v)
     if env.get("BASH_BRIDGE_RULES_ON_READ"):
         cfg["rules_on_read"] = env["BASH_BRIDGE_RULES_ON_READ"].strip().lower()
     if env.get("BASH_BRIDGE_SOURCES"):

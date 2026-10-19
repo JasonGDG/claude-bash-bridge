@@ -145,6 +145,8 @@ def run_arm(work, name, model, budget, claude):
     env.update({
         "BASH_BRIDGE_STATE_DIR": os.path.join(work, "state"),
         "BASH_BRIDGE_SOURCES": "project,local",
+        # throwaway projects are not marked trusted in ~/.claude.json; claude -p skips the trust dialog
+        "BASH_BRIDGE_PROJECT_HOOKS": "1",
         "BASH_BRIDGE_DEBUG": os.path.join(base, "bridge.debug.log"),
     })
     cmd = [claude, "-p", prompt, "--model", model, "--output-format", "stream-json", "--verbose",

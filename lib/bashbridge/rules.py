@@ -194,8 +194,18 @@ def strip_html_comments(text: str) -> str:
     return "\n".join(out)
 
 
-def _walk_md(root: str, limit: int = 500):
+def _walk_md(root: str, limit: int = 500, follow: bool = False):
+    """Markdown files under root. Symlinks (files or folders) are only followed when they stay
+    inside root, unless follow=True. Loops are cut by tracking real paths."""
     res, seen = [], set()
+    top = os.path.realpath(root)
+
+    def allowed(path):
+        if follow:
+            return True
+        real = os.path.realpath(path)
+        return real == top or real.startswith(top + os.sep)
+
     stack = [root]
     while stack and len(res) < limit:
         d = stack.pop()
@@ -206,6 +216,10 @@ def _walk_md(root: str, limit: int = 500):
             seen.add(real)
             with os.scandir(d) as it:
                 for ent in sorted(it, key=lambda e: e.name):
+                    link = ent.is_symlink()
+                    if link and not allowed(ent.path):
+                        debug("rules: skipping symlink %s (points outside %s)" % (ent.path, root))
+                        continue
                     if ent.is_dir():
                         stack.append(ent.path)
                     elif ent.name.endswith(".md") and ent.is_file():
@@ -230,7 +244,7 @@ class RuleSet:
                             (os.path.join(self.project, ".claude", "rules"), "project rule")):
             if not os.path.isdir(base):
                 continue
-            for path in _walk_md(base):
+            for path in _walk_md(base, follow=bool(self.cfg.get("follow_rule_symlinks"))):
                 try:
                     with open(path, "r", encoding="utf-8", errors="replace") as fh:
                         text = fh.read(400000)
@@ -273,7 +287,7 @@ class RuleSet:
             nested_rules = os.path.join(d, ".claude", "rules")
             if os.path.isdir(nested_rules):
                 sub_rel = os.path.relpath(fp, d).replace(os.sep, "/")
-                for path in _walk_md(nested_rules, 100):
+                for path in _walk_md(nested_rules, 100, follow=bool(self.cfg.get("follow_rule_symlinks"))):
                     try:
                         with open(path, "r", encoding="utf-8", errors="replace") as fh:
                             globs, body = parse_frontmatter(fh.read(400000))

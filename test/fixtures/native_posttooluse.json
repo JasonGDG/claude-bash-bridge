@@ -1,0 +1,91 @@
+{
+ "note": "PostToolUse events captured from Claude Code 2.1.303 for native Edit and Write calls (paths and ids scrubbed)",
+ "events": [
+  {
+   "session_id": "00000000-0000-0000-0000-000000000000",
+   "transcript_path": "/HOME/.claude/projects/PROJECT/SESSION.jsonl",
+   "cwd": "/PROJECT",
+   "prompt_id": "00000000-0000-0000-0000-000000000000",
+   "permission_mode": "auto",
+   "effort": {
+    "level": "medium"
+   },
+   "hook_event_name": "PostToolUse",
+   "tool_name": "Edit",
+   "tool_input": {
+    "file_path": "/PROJECT/src/api/users.ts",
+    "old_string": "export const users = 1;",
+    "new_string": "export const users = 2;",
+    "replace_all": false
+   },
+   "tool_response": {
+    "filePath": "/PROJECT/src/api/users.ts",
+    "oldString": "export const users = 1;",
+    "newString": "export const users = 2;",
+    "originalFile": "export const users = 1;\nexport function count() {\n  return users;\n}\n",
+    "structuredPatch": [
+     {
+      "oldStart": 1,
+      "oldLines": 4,
+      "newStart": 1,
+      "newLines": 4,
+      "lines": [
+       "-export const users = 1;",
+       "+export const users = 2;",
+       " export function count() {",
+       "   return users;",
+       " }"
+      ]
+     }
+    ],
+    "userModified": false,
+    "replaceAll": false
+   },
+   "tool_use_id": "toolu_X",
+   "duration_ms": 6
+  },
+  {
+   "session_id": "00000000-0000-0000-0000-000000000000",
+   "transcript_path": "/HOME/.claude/projects/PROJECT/SESSION.jsonl",
+   "cwd": "/PROJECT",
+   "prompt_id": "00000000-0000-0000-0000-000000000000",
+   "permission_mode": "auto",
+   "effort": {
+    "level": "medium"
+   },
+   "hook_event_name": "PostToolUse",
+   "tool_name": "Write",
+   "tool_input": {
+    "file_path": "/PROJECT/src/api/users.ts",
+    "content": "// NESTED-MARKER-4412\nexport const userCount = 1;\nexport function count() {\n  return userCount;\n}\n// RULE-MARKER-7731\n"
+   },
+   "tool_response": {
+    "type": "update",
+    "filePath": "/PROJECT/src/api/users.ts",
+    "content": "// NESTED-MARKER-4412\nexport const userCount = 1;\nexport function count() {\n  return userCount;\n}\n// RULE-MARKER-7731\n",
+    "structuredPatch": [
+     {
+      "oldStart": 1,
+      "oldLines": 4,
+      "newStart": 1,
+      "newLines": 6,
+      "lines": [
+       "-export const users = 1;",
+       "+// NESTED-MARKER-4412",
+       "+export const userCount = 1;",
+       " export function count() {",
+       "-  return users;",
+       "+  return userCount;",
+       " }",
+       "+// RULE-MARKER-7731"
+      ]
+     }
+    ],
+    "originalFile": "export const users = 1;\nexport function count() {\n  return users;\n}\n",
+    "userModified": false
+   },
+   "tool_use_id": "toolu_X",
+   "duration_ms": 10
+  }
+ ]
+}
