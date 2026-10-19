@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 
-from .util import claude_config_dir, read_json
+from .util import claude_config_dir, debug, read_json, trusted_env
 
 DEFAULTS = {
     "enabled": True,
@@ -39,6 +39,7 @@ DEFAULTS = {
     "keep_entries": 300,          # undo log entries kept per project
     "undo_days": 30,              # ...and for at most this many days (pre-images go with them)
     "undo_max_bytes": 200 * 1024 * 1024,  # pre-images kept per Bash call
+    "store_max_bytes": 1024 * 1024 * 1024,  # all pre-images of a project; oldest entries go first
     # Hooks from .claude/settings.json / settings.local.json run only in a project Claude Code
     # has marked trusted (hasTrustDialogAccepted in ~/.claude.json). true = always, false = never.
     "project_hooks": "trusted",
@@ -51,8 +52,12 @@ DEFAULTS = {
     ],
 }
 
-# A cloned repository must not be able to widen what bash-bridge executes or reads.
-USER_ONLY = {"project_hooks", "sources", "plugin_dirs", "include_match_all", "follow_rule_symlinks"}
+# A cloned repository must not be able to widen what bash-bridge executes or reads ...
+USER_ONLY = {"project_hooks", "sources", "plugin_dirs", "include_match_all", "follow_rule_symlinks", "excludes"}
+# ... nor raise its resource limits (it may lower them).
+LOWER_ONLY = {"undo_max_bytes", "store_max_bytes", "keep_entries", "undo_days", "max_file_bytes", "max_files",
+              "hook_timeout_s", "hook_budget_s", "first_snapshot_ms", "snapshot_ms", "scan_ms",
+              "max_bridged_files", "context_chars", "rule_chars"}
 
 _BOOL_ENV = {
     "BASH_BRIDGE_HOOKS": "hooks",
@@ -81,11 +86,28 @@ def load(project_dir: str | None) -> dict:
         files.append(os.path.join(project_dir, ".claude", "bash-bridge.json"))
     for i, path in enumerate(files):
         data = read_json(path, None)
-        if isinstance(data, dict):
-            for k, v in data.items():
-                if k in DEFAULTS and not (i > 0 and k in USER_ONLY):
-                    cfg[k] = v
-    env = os.environ
+        if not isinstance(data, dict):
+            continue
+        for k, v in data.items():
+            if k not in DEFAULTS:
+                continue
+            if i > 0 and k in USER_ONLY:
+                debug("project config may not set %s" % k)
+                continue
+            if i > 0 and k in LOWER_ONLY:
+                try:
+                    if float(v) > float(cfg[k]):
+                        debug("project config may only lower %s" % k)
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            cfg[k] = v
+    # Env vars a project's settings `env` block sets are ignored (except turning bash-bridge off):
+    # Claude Code exports them, so they are as untrusted as the repository itself.
+    env = {k: v for k in list(os.environ) if k.startswith("BASH_BRIDGE_")
+           for v in [trusted_env(k)] if v is not None}
+    if os.environ.get("BASH_BRIDGE_DISABLE"):
+        env["BASH_BRIDGE_DISABLE"] = os.environ["BASH_BRIDGE_DISABLE"]
     if _truthy(env.get("BASH_BRIDGE_DISABLE", "")):
         cfg["enabled"] = False
     for name, key in _BOOL_ENV.items():

@@ -5,7 +5,11 @@ case "$0" in */*) here=${0%/*} ;; *) here=. ;; esac
 here=$(CDPATH= cd -- "$here" && pwd -P)
 root=${here%/*}
 py=""
-for cand in "${BASH_BRIDGE_PYTHON:-}" python3 /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+# BASH_BRIDGE_PYTHON is only honoured outside hook mode: in hooks a project's settings `env`
+# block could set it and make us run a repository-controlled interpreter.
+want=${BASH_BRIDGE_PYTHON:-}
+[ "$1" = "hook" ] && want=""
+for cand in "$want" python3 /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
   [ -n "$cand" ] || continue
   if command -v "$cand" >/dev/null 2>&1; then py=$cand; break; fi
 done

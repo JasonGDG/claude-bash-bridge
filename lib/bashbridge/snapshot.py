@@ -27,7 +27,7 @@ import subprocess
 import time
 import zlib
 
-from .util import check_private_dir, debug, now_ms, read_json, sha_key, state_dir, write_json_atomic
+from .util import UnsafeState, check_private_dir, check_private_file, debug, now_ms, read_json, sha_key, state_dir, write_json_atomic
 
 ZERO_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 SHADOW_ATTRIBUTES = "* -text -eol -crlf -filter -ident -working-tree-encoding\n"
@@ -101,6 +101,46 @@ def disk_state(path: str):
     return ("100755" if os.access(path, os.X_OK) else "100644", sha)
 
 
+KNOWN_INDEX_EXTENSIONS = {b"TREE", b"REUC", b"EOIE", b"IEOT"}
+
+
+def index_is_plain(data: bytes) -> bool:
+    """True for a v2/v3 SHA-1 index whose checksum is valid, with no extended entry flags
+    (skip-worktree, intent-to-add) and only extensions that mean the same in the shadow repo
+    (cache tree, resolve-undo, offset tables). Anything else is not seeded."""
+    try:
+        if len(data) < 32 or data[:4] != b"DIRC":
+            return False
+        ver = int.from_bytes(data[4:8], "big")
+        if ver not in (2, 3):
+            return False
+        body, trailer = data[:-20], data[-20:]
+        if trailer != b"\0" * 20 and hashlib.sha1(body).digest() != trailer:
+            return False
+        n = int.from_bytes(data[8:12], "big")
+        pos = 12
+        end_entries = len(data) - 20
+        for _ in range(n):
+            flags = int.from_bytes(data[pos + 60:pos + 62], "big")
+            if flags & 0x4000:
+                return False
+            namelen = flags & 0x0FFF
+            name_end = pos + 62 + namelen if namelen < 0xFFF else data.index(b"\0", pos + 62)
+            pos += ((name_end - pos) // 8 + 1) * 8
+            if pos > end_entries:
+                return False
+        while pos < end_entries:
+            sig = data[pos:pos + 4]
+            size = int.from_bytes(data[pos + 4:pos + 8], "big")
+            if sig not in KNOWN_INDEX_EXTENSIONS:
+                debug("index extension %r: not seeding" % sig)
+                return False
+            pos += 8 + size
+        return pos == end_entries
+    except (ValueError, IndexError):
+        return False
+
+
 def project_key(worktree: str) -> str:
     return sha_key(os.path.realpath(worktree))
 
@@ -121,6 +161,8 @@ class Store:
         for p in (self.dir, self.gitdir, self.pending_dir, self.blobs_dir):
             if os.path.lexists(p):
                 check_private_dir(p)  # no symlinks, ours, 0700
+        for name in ("meta.json", "entries.jsonl", "lock", "last-gc"):
+            check_private_file(os.path.join(self.dir, name))  # regular, ours, 0600
 
     # ------------------------------------------------------------------ basics
     def env(self) -> dict:
@@ -208,11 +250,11 @@ class Store:
         try:
             cfg = run_git(["-C", self.worktree, "config", "--get-regexp",
                            r"^(core\.(autocrlf|splitindex|sparsecheckout|sparsecheckoutcone|fsmonitor|untrackedcache)"
-                           r"|index\.sparse|feature\.manyfiles|extensions\.worktreeconfig)$"],
+                           r"|index\.sparse|feature\.manyfiles|extensions\.worktreeconfig|extensions\.objectformat)$"],
                           timeout=3.0, check=False)
             for line in cfg.decode("utf-8", "replace").splitlines():
                 parts = line.split()
-                if len(parts) >= 2 and parts[1].lower() not in ("false", "0", "no", "off"):
+                if len(parts) >= 2 and parts[1].lower() not in ("false", "0", "no", "off", "sha1"):
                     return False
             if os.path.exists(os.path.join(real_gitdir, "info", "sparse-checkout")):
                 return False
@@ -344,11 +386,15 @@ class Store:
             if self._seed_is_safe(real_gitdir):
                 try:
                     src = os.path.join(real_gitdir, "index")
-                    before = os.stat(src)
-                    shutil.copyfile(src, os.path.join(self.gitdir, "index"))
-                    after = os.stat(src)
-                    if (before.st_mtime_ns, before.st_size, before.st_ino) != \
-                            (after.st_mtime_ns, after.st_size, after.st_ino) or os.path.exists(src + ".lock"):
+                    with open(src, "rb") as fh:
+                        data = fh.read()
+                    if not index_is_plain(data):
+                        raise OSError("project index has features the shadow repo can't share")
+                    with open(os.path.join(self.gitdir, "index"), "wb") as fh:
+                        fh.write(data)
+                    with open(src, "rb") as fh:
+                        again = fh.read()
+                    if again != data or os.path.exists(src + ".lock"):
                         raise OSError("project index changed while copying")
                     self.git(["write-tree"], timeout=10.0)  # fails on unmerged/odd indexes
                     seeded = True
@@ -472,12 +518,33 @@ class Store:
 
     def pop_pending(self, tool_use_id: str):
         path = self.pending_path(tool_use_id)
+        check_private_file(path)
         data = read_json(path, None)
         try:
             os.remove(path)
         except OSError:
             pass
         return data
+
+    def fresh_pending(self, exclude: str, max_age_s: float = 600):
+        """Other calls that took a pre-snapshot in the last max_age_s and have not finished."""
+        from .util import safe_id
+        res = []
+        mine = safe_id(exclude) + ".json"
+        try:
+            for name in os.listdir(self.pending_dir):
+                p = os.path.join(self.pending_dir, name)
+                if name != mine and name.endswith(".json") and time.time() - os.path.getmtime(p) < max_age_s:
+                    res.append(p)
+        except OSError:
+            pass
+        return res
+
+    def mark_overlap(self, path: str) -> None:
+        data = read_json(path, None)
+        if isinstance(data, dict) and not data.get("overlap"):
+            data["overlap"] = True
+            write_json_atomic(path, data)
 
     def prune_pending(self, max_age_s: float = 86400) -> None:
         try:
@@ -515,7 +582,10 @@ class Store:
         return res
 
     def keep_blobs(self, shas, max_bytes: int) -> set:
-        """Copy the given blobs into the pre-image store. Returns the shas that are stored."""
+        """Copy the given blobs into the pre-image store, streaming (bounded memory) and within
+        max_bytes in total; sizes are checked from `cat-file --batch-check` before anything is read.
+        Returns the shas that are stored."""
+        import threading
         stored, todo = set(), []
         for sha in shas:
             if os.path.isfile(self.blob_path(sha)):
@@ -524,45 +594,98 @@ class Store:
                 todo.append(sha)
         if not todo:
             return stored
+        sizes = {}
+        out = self.git(["cat-file", "--batch-check"], input_bytes=("\n".join(todo) + "\n").encode(),
+                       timeout=60.0, check=False)
+        for line in out.decode("ascii", "replace").splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[1] == "blob":
+                sizes[parts[0]] = int(parts[2])
+        chosen, total = [], 0
+        for sha in todo:
+            size = sizes.get(sha)
+            if size is None or total + size > max_bytes:
+                debug("pre-image %s not kept (%s bytes, cap %d)" % (sha, size, max_bytes))
+                continue
+            total += size
+            chosen.append(sha)
+        if not chosen:
+            return stored
         proc = subprocess.Popen(["git", "cat-file", "--batch"], cwd=self.worktree, env=self.env(),
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        def feed():
+            try:
+                proc.stdin.write(("\n".join(chosen) + "\n").encode())
+                proc.stdin.close()
+            except OSError:
+                pass
+
+        t = threading.Thread(target=feed, daemon=True)
+        t.start()
         try:
-            out, _ = proc.communicate(("\n".join(todo) + "\n").encode(), timeout=120)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            return stored
-        pos, total = 0, 0
-        for sha in todo:
-            nl = out.find(b"\n", pos)
-            if nl < 0:
-                break
-            header = out[pos:nl].split(b" ")
-            pos = nl + 1
-            if len(header) != 3:
-                continue  # "<sha> missing"
-            size = int(header[2])
-            data = out[pos:pos + size]
-            pos += size + 1
-            total += size
-            if total > max_bytes:
-                debug("pre-image store cap reached; %s not kept" % sha)
-                continue
-            path = self.blob_path(sha)
-            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-            tmp = path + ".%d.tmp" % os.getpid()
-            with open(tmp, "wb") as fh:
-                fh.write(zlib.compress(data, 1))
-            os.replace(tmp, path)
-            stored.add(sha)
+            for sha in chosen:
+                header = proc.stdout.readline().split()
+                if len(header) != 3:
+                    continue
+                size = int(header[2])
+                path = self.blob_path(sha)
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                tmp = path + ".%d.tmp" % os.getpid()
+                comp = zlib.compressobj(1)
+                left = size
+                with open(tmp, "wb") as fh:
+                    while left > 0:
+                        chunk = proc.stdout.read(min(1 << 20, left))
+                        if not chunk:
+                            break
+                        left -= len(chunk)
+                        fh.write(comp.compress(chunk))
+                    fh.write(comp.flush())
+                proc.stdout.read(1)  # trailing newline
+                if left:
+                    os.remove(tmp)
+                    break
+                os.replace(tmp, path)
+                stored.add(sha)
+        finally:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait()
         return stored
+
+    def store_bytes(self) -> int:
+        total = 0
+        for d, _s, files in os.walk(self.blobs_dir):
+            for f in files:
+                try:
+                    total += os.lstat(os.path.join(d, f)).st_size
+                except OSError:
+                    pass
+        return total
 
     def load_blob(self, sha: str):
         """Pre-image bytes, or None if expired / missing / corrupt."""
         try:
-            with open(self.blob_path(sha), "rb") as fh:
+            fd = os.open(self.blob_path(sha), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return None
+        try:
+            st = os.fstat(fd)
+            if hasattr(os, "getuid") and st.st_uid != os.getuid():
+                raise UnsafeState("pre-image %s is owned by another user" % sha)
+            if st.st_mode & 0o077:
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "rb") as fh:
+                fd = None
                 data = zlib.decompress(fh.read())
         except (OSError, zlib.error):
             return None
+        finally:
+            if fd is not None:
+                os.close(fd)
         h = hashlib.sha1(b"blob %d\0" % len(data))
         h.update(data)
         return data if h.hexdigest() == sha else None
@@ -605,16 +728,24 @@ class Store:
                 fh.write(json.dumps(e, ensure_ascii=False) + "\n")
         os.replace(tmp, self.entries_path)
 
-    def add_entry(self, entry: dict, keep: int, max_age_days: float = 30.0) -> dict:
+    def add_entry(self, entry: dict, keep: int, max_age_days: float = 30.0,
+                  store_max: int = 1024 * 1024 * 1024) -> dict:
         entries = self.load_entries()
         entry["id"] = (entries[-1]["id"] + 1) if entries else 1
         entry.setdefault("ts", time.time())
         entries.append(entry)
         cutoff = time.time() - max_age_days * 86400
         kept = [e for e in entries if e.get("ts", 0) >= cutoff][-keep:]
-        self.save_entries(kept)
         if len(kept) != len(entries):
+            self.save_entries(kept)
             self.gc_blobs(kept)
+        # project-wide cap: drop the oldest entries (and their pre-images) until it fits
+        while len(kept) > 1 and self.store_bytes() > store_max:
+            debug("pre-image store over %d bytes: expiring entry %s" % (store_max, kept[0].get("id")))
+            kept = kept[1:]
+            self.save_entries(kept)
+            self.gc_blobs(kept)
+        self.save_entries(kept)
         return entry
 
     def gc_blobs(self, entries) -> None:
@@ -641,34 +772,72 @@ class Store:
         self.save_entries(entries)
 
 
-def _parent_ok(store: Store, full: str) -> None:
-    parent = os.path.dirname(full)
-    if not _inside(parent, store.worktree):
-        raise OSError("refusing to write through a symlink that leaves the project: %s"
-                      % os.path.relpath(full, store.worktree))
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
+
+def _open_parent(store: Store, rel: str, create: bool):
+    """Open the directory that will contain rel, one component at a time relative to the
+    previous directory's fd and with O_NOFOLLOW, so no symlink (even one swapped in while we
+    work) can lead outside the project. Returns (dir_fd, basename). Caller closes dir_fd."""
+    parts = [p for p in rel.replace(os.sep, "/").split("/") if p]
+    if not parts or any(p in (".", "..") for p in parts):
+        raise OSError("bad path %r" % rel)
+    fd = os.open(store.worktree, os.O_RDONLY | _DIRECTORY)
+    try:
+        for comp in parts[:-1]:
+            try:
+                nfd = os.open(comp, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(comp, 0o755, dir_fd=fd)
+                nfd = os.open(comp, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=fd)
+            except (NotADirectoryError, OSError) as e:
+                st = os.stat(comp, dir_fd=fd, follow_symlinks=False)
+                import stat as _st
+                if _st.S_ISLNK(st.st_mode):
+                    raise OSError("refusing to follow the symlink %s in %s" % (comp, rel))
+                if create and _st.S_ISREG(st.st_mode):
+                    os.unlink(comp, dir_fd=fd)  # a file now sits where the directory was
+                    os.mkdir(comp, 0o755, dir_fd=fd)
+                    nfd = os.open(comp, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=fd)
+                else:
+                    raise e
+            os.close(fd)
+            fd = nfd
+        return fd, parts[-1]
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def write_file(store: Store, rel: str, mode: str, data: bytes) -> None:
-    """Atomically put (mode, data) at rel. Never follows a symlink at rel or above it outside the project."""
-    full = os.path.join(store.worktree, rel)
-    parent = os.path.dirname(full)
-    if os.path.lexists(parent) and not os.path.isdir(parent):
-        os.remove(parent)  # a file or symlink now sits where the directory was
-    os.makedirs(parent, exist_ok=True)
-    _parent_ok(store, full)
-    if os.path.lexists(full) and not os.path.islink(full) and os.path.isdir(full):
-        os.rmdir(full)  # only an empty directory; anything else raises and is reported
-    tmp = os.path.join(parent, ".%s.bash-bridge-%d" % (os.path.basename(full)[:80], os.getpid()))
-    if os.path.lexists(tmp):
-        os.remove(tmp)
-    if mode == "120000":
-        os.symlink(os.fsdecode(data), tmp)
-    else:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-        os.chmod(tmp, 0o755 if mode == "100755" else 0o644)
-    os.replace(tmp, full)  # replaces a symlink itself, never its target
+    """Atomically put (mode, data) at rel via dir fds: never follows a symlink, at rel or above it."""
+    import stat as _st
+    dfd, name = _open_parent(store, rel, create=True)
+    try:
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if _st.S_ISDIR(st.st_mode):
+                os.rmdir(name, dir_fd=dfd)  # only an empty directory; anything else raises
+        except FileNotFoundError:
+            pass
+        tmp = ".%s.bash-bridge-%d" % (name[:80], os.getpid())
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        if mode == "120000":
+            os.symlink(os.fsdecode(data), tmp, dir_fd=dfd)
+        else:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600, dir_fd=dfd)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                os.fchmod(fh.fileno(), 0o755 if mode == "100755" else 0o644)
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)  # replaces a symlink itself
+    finally:
+        os.close(dfd)
 
 
 def write_blob_to(store: Store, tree: str, rel: str) -> bool:
@@ -681,11 +850,21 @@ def write_blob_to(store: Store, tree: str, rel: str) -> bool:
 
 
 def remove_path(store: Store, rel: str) -> None:
-    """Delete a file the Bash call created. Directories are left alone."""
-    full = os.path.join(store.worktree, rel)
-    _parent_ok(store, full)
-    if os.path.islink(full) or os.path.isfile(full):
-        os.remove(full)
+    """Delete a file the Bash call created (via dir fds, never through a symlink). Directories stay."""
+    import stat as _st
+    try:
+        dfd, name = _open_parent(store, rel, create=False)
+    except FileNotFoundError:
+        return
+    try:
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not _st.S_ISDIR(st.st_mode):
+            os.unlink(name, dir_fd=dfd)
+    finally:
+        os.close(dfd)
 
 
 def _inside(path: str, root: str) -> bool:

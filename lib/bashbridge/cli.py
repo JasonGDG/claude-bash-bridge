@@ -90,6 +90,8 @@ def cmd_list(args) -> int:
     print("bash-bridge: Bash calls that changed files in %s (newest last)" % store.worktree)
     for e in entries:
         flag = " [undone]" if e.get("undone") else ""
+        if e.get("overlap"):
+            flag += " [overlapped another Bash call: changes may belong to it]"
         if e.get("files") is None or any(not f.get("kept", True) for f in e.get("files") or []):
             flag += " [expired: cannot be undone fully]"
         print("#%-4s %s  %s%s" % (e.get("id"), _fmt_time(e.get("ts")), _one_line(e.get("command")), flag))

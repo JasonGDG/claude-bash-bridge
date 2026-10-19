@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 
-from .util import PLUGIN_ROOT, claude_config_dir, debug, read_json, restore_umask
+from .util import PLUGIN_ROOT, claude_config_dir, debug, read_json, real_home, restore_umask
 
 EXACT_MATCHER = re.compile(r"^[A-Za-z0-9_\- ,|]*$")
 MANAGED_SETTINGS = "/Library/Application Support/ClaudeCode/managed-settings.json"
@@ -40,10 +40,13 @@ def managed_settings_path() -> str:
 
 def project_trusted(project_dir: str) -> bool:
     """True if Claude Code recorded the workspace trust dialog as accepted for project_dir or a parent."""
+    # $CLAUDE_CONFIG_DIR only counts when the project's own settings did not set it (trusted_env)
+    # and it does not point into the project; the account's real ~/.claude.json always counts.
     cands = []
-    if os.environ.get("CLAUDE_CONFIG_DIR"):
-        cands.append(os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".claude.json"))
-    cands.append(os.path.join(os.path.expanduser("~"), ".claude.json"))
+    cfg_dir = claude_config_dir()
+    if os.path.realpath(cfg_dir) != os.path.realpath(os.path.join(real_home(), ".claude")):
+        cands.append(os.path.join(cfg_dir, ".claude.json"))
+    cands.append(os.path.join(real_home(), ".claude.json"))
     real = os.path.realpath(project_dir)
     for path in cands:
         data = read_json(path, None)

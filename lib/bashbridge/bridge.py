@@ -31,6 +31,8 @@ def session_path(sid: str) -> str:
 
 
 def load_session(sid: str) -> dict:
+    from .util import check_private_file
+    check_private_file(session_path(sid))
     d = read_json(session_path(sid), None)
     if not isinstance(d, dict):
         d = {}
@@ -168,10 +170,16 @@ def handle_pre(event, cfg):
             first = not store.meta().get("ready")
             store.ensure(cfg)
             tree = store.snapshot(cfg, first=first)
+            # another Bash call between its pre and post in this project? then neither call
+            # can tell which changes are its own
+            others = store.fresh_pending(exclude=tuid)
+            for o in others:
+                store.mark_overlap(o)
+            store.save_pending(tuid, {"tree": tree, "ts": time.time(), "project_dir": project_dir,
+                                      "overlap": bool(others)})
     except Disabled as e:
         store.save_pending(tuid, {"disabled": str(e)})
         return None
-    store.save_pending(tuid, {"tree": tree, "ts": time.time(), "project_dir": project_dir})
     debug("pre %s: tree %s in %d ms" % (tuid, tree[:10], (time.time() - t0) * 1000))
     return None
 
@@ -212,6 +220,7 @@ def handle_post(event, cfg, failure=False):
         with store.lock(timeout=10.0):
             post_tree = store.snapshot(cfg)
             changes = store.diff(pre_tree, post_tree)
+            overlap = bool(pending.get("overlap")) or bool(store.fresh_pending(exclude=tuid))
     except Disabled:
         return None
     if not changes:
@@ -220,11 +229,13 @@ def handle_post(event, cfg, failure=False):
     debug("post %s: %d changes %s" % (tuid, len(changes), changes[:5]))
 
     entry = {"session": sid, "tool_use_id": tuid, "cwd": event.get("cwd"), "command": truncate(cmd, 4000),
-             "pre": pre_tree, "post": post_tree, "changes": changes, "project_dir": project_dir}
+             "pre": pre_tree, "post": post_tree, "changes": changes, "project_dir": project_dir,
+             "overlap": overlap}
     if cfg["undo"]:
         with store.lock(timeout=10.0):
             store.record_files(entry, cfg)
-            entry = store.add_entry(entry, int(cfg["keep_entries"]), float(cfg["undo_days"]))
+            entry = store.add_entry(entry, int(cfg["keep_entries"]), float(cfg["undo_days"]),
+                                    int(cfg["store_max_bytes"]))
 
     def abs_of(rel):
         return os.path.join(store.worktree, rel)
@@ -283,7 +294,7 @@ def handle_post(event, cfg, failure=False):
                             # only roll back what this command wrote: if the file changed again since
                             # the post-snapshot (another call, a formatter, the user), leave it alone
                             post_info = store.entry_info(post_tree, rel)
-                            if disk_state(abs_of(rel)) != (tuple(post_info) if post_info else None):
+                            if overlap or disk_state(abs_of(rel)) != (tuple(post_info) if post_info else None):
                                 conflicts.add(rel)
                                 continue
                             if st == "A":
@@ -296,6 +307,9 @@ def handle_post(event, cfg, failure=False):
             for st, rel, tool, label, reason in denied:
                 if rel in reverted:
                     action = "bash-bridge restored the file to its state before the Bash command"
+                elif rel in conflicts and overlap:
+                    action = ("another Bash call ran in this project at the same time, so the change may not be "
+                              "this command's; bash-bridge did NOT roll it back, the change is still on disk")
                 elif rel in conflicts:
                     action = ("the file changed again after the Bash command, so bash-bridge did NOT roll it "
                               "back; the change is still on disk")

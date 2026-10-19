@@ -10,12 +10,67 @@ import time
 PLUGIN_ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 
+def real_home() -> str:
+    """The account's home directory from the password database, not $HOME (which settings can set)."""
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        return os.path.expanduser("~")
+
+
+_PROJECT_ENV = {}
+
+
+def project_env_keys(project_dir=None) -> set:
+    """Environment variable names a project's own settings files set through their `env` block.
+    A cloned repository controls those values, so bash-bridge ignores them for anything that
+    could widen what it executes, reads or where it stores data."""
+    project_dir = project_dir or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    key = os.path.realpath(project_dir)
+    if key in _PROJECT_ENV:
+        return _PROJECT_ENV[key]
+    names = set()
+    for rel in ("settings.json", "settings.local.json"):
+        data = read_json(os.path.join(key, ".claude", rel), None)
+        env = data.get("env") if isinstance(data, dict) else None
+        if isinstance(env, dict):
+            names.update(str(k) for k in env)
+    _PROJECT_ENV[key] = names
+    return names
+
+
+def trusted_env(name: str):
+    """os.environ[name], unless the project's settings set it (then None)."""
+    val = os.environ.get(name)
+    if val is None:
+        return None
+    if name in project_env_keys():
+        debug("ignoring %s: set by the project's settings env" % name)
+        return None
+    return val
+
+
+def _inside_project(path: str) -> bool:
+    proj = os.environ.get("CLAUDE_PROJECT_DIR")
+    if not proj:
+        return False
+    real, top = os.path.realpath(path), os.path.realpath(proj)
+    return real == top or real.startswith(top + os.sep)
+
+
 def claude_config_dir() -> str:
-    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    v = trusted_env("CLAUDE_CONFIG_DIR")
+    if v and not _inside_project(v):
+        return v
+    return os.path.join(real_home(), ".claude")
 
 
 def state_dir() -> str:
-    return os.environ.get("BASH_BRIDGE_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".claude-bash-bridge")
+    v = trusted_env("BASH_BRIDGE_STATE_DIR")
+    if v and not _inside_project(v):
+        return v
+    return os.path.join(real_home(), ".claude-bash-bridge")
 
 
 # umask of the process before secure_state() tightened it; restored for the user's hooks
@@ -24,6 +79,21 @@ ORIG_UMASK = None
 
 class UnsafeState(Exception):
     pass
+
+
+def check_private_file(path: str) -> None:
+    """An existing state file must be a regular file we own; group/other bits are removed."""
+    import stat as _stat
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not _stat.S_ISREG(st.st_mode):
+        raise UnsafeState("%s is not a regular file" % path)
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise UnsafeState("%s is owned by another user" % path)
+    if st.st_mode & 0o077:
+        os.chmod(path, 0o600)
 
 
 def check_private_dir(path: str) -> None:
@@ -63,7 +133,7 @@ def restore_umask() -> None:
 def debug(msg: str) -> None:
     """Append a line to the debug log if BASH_BRIDGE_DEBUG names a file. Never raises."""
     path = os.environ.get("BASH_BRIDGE_DEBUG")
-    if not path:
+    if not path or "BASH_BRIDGE_DEBUG" in project_env_keys():
         return
     try:
         with open(path, "a", encoding="utf-8") as fh:
