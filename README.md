@@ -18,7 +18,7 @@ In Auto Mode and bypass mode, Claude Code's system prompt tells the model to do 
 | Path-scoped rules (`.claude/rules/*.md` with `paths:`) and nested `CLAUDE.md` files don't load for files touched through Bash. 2.1.288 and 2.1.293 fixed Write/Edit and plain single-file `cat`/`head`. A 2.1.296 measurement shows pipes, `cd … &&`, redirects and **every Bash write** still load nothing. | [#90450](https://github.com/anthropics/claude-code/issues/90450), [#88565](https://github.com/anthropics/claude-code/issues/88565) |
 | `/rewind` says it succeeded, but files Bash changed stay changed. A `sed` range delete with a mistyped end pattern cuts a file down to its first lines, and there's nothing to restore from. | [#87575](https://github.com/anthropics/claude-code/issues/87575), [#87971](https://github.com/anthropics/claude-code/issues/87971) |
 
-`CLAUDE_CODE_THRIFTY_SONIC=0` in `settings.json` removes the Bash-first instruction (see the issues). It doesn't help when a model picks Bash anyway: bulk renames, `sed` one-liners, or a prompt that asks for Bash. bash-bridge works either way.
+The undocumented `CLAUDE_CODE_THRIFTY_SONIC=0` (or `false`) in `settings.json` `env` removes the Bash-first instruction (found by users, see the issues). It doesn't help when a model picks Bash anyway (one commenter in #87971 reports Opus 5.5 still uses Bash a lot with it set): bulk renames, `sed` one-liners, or a prompt that asks for Bash. bash-bridge works either way.
 
 ## What it does
 
@@ -120,7 +120,7 @@ It covers:
 
 The project's own `.git/index` is checked byte for byte: it stays untouched.
 
-Hook overhead in a small warm repo: about 340–360 ms for pre and post together with Homebrew Python 3.14, about 500 ms with macOS's `/usr/bin/python3`, start-up included. Inside real sessions the pre hook took 38–48 ms of its own work, plus about 370 ms the first time while it creates the shadow repo.
+Hook overhead in a small warm repo (0.2.0 measurement): about 400–500 ms for pre and post together with Homebrew Python 3.14, about 515–545 ms with macOS's `/usr/bin/python3`, start-up included. Clearly read-only commands cost about 0.1 s (no snapshot). Inside real sessions the pre hook took 38–48 ms of its own work, plus about 370 ms the first time while it creates the shadow repo.
 
 ### End-to-end against real Claude Code 2.1.303
 
