@@ -50,7 +50,7 @@ PostToolUse(Bash)  -> snapshot again, diff: created / modified / deleted
 
 ### Unit and integration tests
 
-`test/run.sh` simulates Claude Code calling the hooks around real shell commands. The suite has 143 tests. All passed on Python 3.14 in the last full run. The macOS `/usr/bin/python3` 3.9 run passed before the last round of fixes; its re-run is pending. `test/test_livetest.py` reproduces the bugs a live stress test found (34 real `claude -p` sessions):
+`test/run.sh` simulates Claude Code calling the hooks around real shell commands. The suite has 143 tests. All pass on Python 3.14 and on macOS's `/usr/bin/python3` 3.9. `test/test_livetest.py` reproduces the bugs a live stress test found (34 real `claude -p` sessions):
 * a call denied by a permission rule (its PreToolUse ran, its PostToolUse never came) is cleared through PermissionDenied, PostToolBatch and the transcript, so it can't switch the guard off;
 * the classifier treats `sed -Ei`/`-ni`/`-ri`, `git stash`, `tree -o`, `xxd in out` and `rg --pre` as writers;
 * the Bash command is no longer in synthesized events;
