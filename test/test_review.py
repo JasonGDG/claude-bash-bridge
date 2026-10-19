@@ -49,6 +49,9 @@ class F1GuardRollbackConflict(BridgeCase):
         for t, c in ((t1, c1), (t2, c2)):
             self.assertEqual(self.run_hook("post", self.event("post", c, t))[0], 0)
         code, out, err = self.cli("undo", "2", "--project", self.proj)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("overlapped another Bash call", out)
+        code, out, err = self.cli("undo", "2", "--force", "--project", self.proj)
         self.assertEqual(code, 0, out + err)
         self.assertEqual(self.read("target.txt"), "keep me\n")
         self.assertEqual(self.read("other.txt"), "o\n")

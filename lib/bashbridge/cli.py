@@ -5,6 +5,7 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 import time
 
@@ -72,7 +73,8 @@ def _one_line(cmd, n=90):
     return c if len(c) <= n else c[: n - 3] + "..."
 
 
-WORD = {"A": "created", "M": "modified", "T": "type changed", "D": "deleted"}
+WORD = {"A": "created", "M": "modified", "T": "type changed", "D": "deleted",
+        "B": "changed (too large to snapshot)", "U": "created (unreadable, not snapshotted)"}
 
 
 def cmd_list(args) -> int:
@@ -92,14 +94,34 @@ def cmd_list(args) -> int:
         flag = " [undone]" if e.get("undone") else ""
         if e.get("overlap"):
             flag += " [overlapped another Bash call: changes may belong to it]"
-        if e.get("files") is None or any(not f.get("kept", True) for f in e.get("files") or []):
+        if entry_expired(store, e):
             flag += " [expired: cannot be undone fully]"
-        print("#%-4s %s  %s%s" % (e.get("id"), _fmt_time(e.get("ts")), _one_line(e.get("command")), flag))
+        print("#%-4s %s  %s%s" % (e.get("id"), _fmt_time(e.get("ts")), show(_one_line(e.get("command"))), flag))
         for st, rel in e.get("changes", [])[:20]:
-            print("        %-9s %s" % (WORD.get(st, st), rel))
+            print("        %-9s %s" % (WORD.get(st, st), show(rel)))
         if len(e.get("changes", [])) > 20:
             print("        ... %d more" % (len(e["changes"]) - 20))
     return 0
+
+
+def show(rel) -> str:
+    """Path for terminal output: control characters (newline, tab, ESC ...) escaped."""
+    return "".join(c if (ord(c) >= 32 and ord(c) != 127) else ("\\n" if c == "\n" else "\\x%02x" % ord(c))
+                   for c in str(rel))
+
+
+def entry_expired(store, e) -> bool:
+    files = e.get("files")
+    if files is None:
+        return True
+    for f in files:
+        if f.get("st") in ("B", "U"):
+            continue
+        if not f.get("kept", True):
+            return True
+        if f.get("pre") and not os.path.isfile(store.blob_path(f["pre"][1])):
+            return True
+    return False
 
 
 def _files_of(e):
@@ -126,13 +148,17 @@ def plan_undo(store, entries, force=False):
             full = os.path.join(store.worktree, rel)
             current = virtual[rel] if rel in virtual else disk_state(full)
             conflict = current != post
+            if f.get("st") in ("B", "U"):
+                steps.append({"entry": e["id"], "rel": rel, "action": "toolarge" if f["st"] == "B" else "unreadable",
+                              "conflict": False, "expected": None, "pre": None})
+                continue
             if pre and post:
                 action = "restore"
             elif pre:
                 action = "recreate"
             else:
                 action = "remove"
-            if pre and current == pre:
+            if (pre and current == pre) or (pre is None and current is None):
                 action, conflict = "unchanged", False
             elif pre and (not f.get("kept", True) or store.load_blob(pre[1]) is None):
                 action = "expired"
@@ -174,10 +200,32 @@ def cmd_undo(args) -> int:
         by_entry = {}
         for st in steps:
             by_entry.setdefault(st["entry"], []).append(st)
+        # remove what the call created first (deepest first), then restore: a file that was
+        # replaced by a directory can only come back once the directory is empty again
+        for k, lst in by_entry.items():
+            lst.sort(key=lambda x: (0 if x["action"] == "remove" else 1,
+                                    -x["rel"].count("/") if x["action"] == "remove" else 0))
         for e in entries:
             print("Bash call id %s at %s: %s" % (e["id"], _fmt_time(e.get("ts")), _one_line(e.get("command"))))
+            if e.get("overlap") and not args.force:
+                print("    SKIPPED         (this call overlapped another Bash call, so its entry may include that "
+                      "call's changes; --force undoes it anyway)")
+                failed += 1
+                incomplete.add(e["id"])
+                continue
             for st in by_entry.get(e["id"], []):
-                rel = st["rel"]
+                rel = show(st["rel"])
+                if st["action"] == "toolarge":
+                    print("    TOO LARGE       %s (over max_file_bytes when it changed; not snapshotted, cannot undo)"
+                          % rel)
+                    failed += 1
+                    incomplete.add(e["id"])
+                    continue
+                if st["action"] == "unreadable":
+                    print("    UNREADABLE      %s (created without read permission; not snapshotted, left alone)" % rel)
+                    failed += 1
+                    incomplete.add(e["id"])
+                    continue
                 if st["action"] == "expired":
                     print("    EXPIRED         %s (its previous content is no longer stored; cannot undo)" % rel)
                     failed += 1
@@ -192,7 +240,7 @@ def cmd_undo(args) -> int:
                 if args.dry_run or st["action"] == "unchanged":
                     print("    %-15s %s %s" % (label, rel, note[st["action"]]))
                     continue
-                full = os.path.join(store.worktree, rel)
+                full = os.path.join(store.worktree, st["rel"])
                 # re-check right before touching the file: something may have written it since planning
                 if not args.force and disk_state(full) != st["expected"]:
                     print("    SKIPPED         %s (changed while undoing; --force overwrites it)" % rel)
@@ -201,12 +249,12 @@ def cmd_undo(args) -> int:
                     continue
                 try:
                     if st["action"] == "remove":
-                        remove_path(store, rel)
+                        remove_path(store, st["rel"])
                     else:
                         data = store.load_blob(st["pre"][1])
                         if data is None:
                             raise OSError("previous content is no longer stored")
-                        write_file(store, rel, st["pre"][0], data)
+                        write_file(store, st["rel"], st["pre"][0], data)
                     done += 1
                     print("    %-15s %s %s" % (label, rel, note[st["action"]]))
                 except OSError as ex:
@@ -225,6 +273,10 @@ def cmd_undo(args) -> int:
         print("Nothing was changed. To apply: /bash-undo %d   (or: bash-bridge undo %d)" % (len(entries), len(entries)))
     else:
         print("Done: %d file(s) changed back." % done)
+        if done and any(re.search(r"\bgit\s+(-C\s+\S+\s+)?(rm|mv|add|reset|restore\s+--staged)\b", e.get("command") or "")
+                        for e in entries):
+            print("Note: only the files were restored. Changes to the git index (staged adds/removals) are not "
+                  "undone; check `git status`.")
     if failed:
         print("%d file(s) skipped, expired or failed." % failed)
     return 0 if not failed else 2

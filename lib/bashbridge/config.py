@@ -34,7 +34,8 @@ DEFAULTS = {
     "scan_ms": 400,               # budget for the file-count pre-scan of non-git dirs
     "hook_timeout_s": 60,         # cap per bridged hook (their own timeout still applies if lower)
     "hook_budget_s": 240,         # cap for all bridged hooks of one Bash call
-    "max_bridged_files": 50,      # at most this many files get synthesized events per Bash call
+    "max_bridged_files": 50,
+    "hook_workers": 4,            # files whose hooks run at the same time (1 = one file after another)      # at most this many files get synthesized events per Bash call
     "context_chars": 9000,        # stay under Claude Code's 10,000-char additionalContext cap
     "rule_chars": 4000,           # per rule / CLAUDE.md file
     "keep_entries": 300,          # undo log entries kept per project

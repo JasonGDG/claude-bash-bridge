@@ -365,7 +365,7 @@ def handle_post(event, cfg, failure=False):
         if tasks:
             ran_any = True
             cap = min(float(cfg["hook_timeout_s"]), max(1.0, budget_end - time.time()))
-            for (st, rel, tool), results in run_many(tasks, project_dir, cwd, cap, extra_env):
+            for (st, rel, tool), results in run_many(tasks, project_dir, cwd, cap, extra_env, int(cfg.get("hook_workers", 4))):
                 for r in results:
                     ip = interpret_pre(r)
                     if ip["deny"]:
@@ -420,7 +420,7 @@ def handle_post(event, cfg, failure=False):
         if tasks:
             ran_any = True
             cap = min(float(cfg["hook_timeout_s"]), max(1.0, budget_end - time.time()))
-            for (st, rel, tool), results in run_many(tasks, project_dir, cwd, cap, extra_env):
+            for (st, rel, tool), results in run_many(tasks, project_dir, cwd, cap, extra_env, int(cfg.get("hook_workers", 4))):
                 for r in results:
                     ip = interpret_post(r)
                     lab = r.handler.label()

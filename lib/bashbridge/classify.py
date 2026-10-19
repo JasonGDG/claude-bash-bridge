@@ -102,20 +102,28 @@ def _reader_ok(words) -> bool:
             return True
         sub = args[j]
         rest = args[j + 1:]
+        # only an explicit allow-list counts as read-only; branch/stash/tag/remote/config/worktree can write
         if sub in GIT_READ:
             return not any(a in ("--output", "-o") or a.startswith("--output=") for a in rest)
-        if sub == "branch":
-            return all(a.startswith("-") and a in ("-a", "-r", "-v", "-vv", "--list", "--show-current", "-l",
-                                                    "--all", "--remotes", "--contains", "--merged")
-                       for a in rest)
-        if sub in ("remote", "stash", "worktree", "tag", "config"):
-            return (not rest) or rest[0] in ("-v", "list", "show", "--get", "--list", "-l", "get")
         return False
     if prog == "sed":
-        if any(a == "-i" or a.startswith("-i") or a.startswith("--in-place") or a == "-I" for a in args):
-            return False
+        for a in args:
+            if a.startswith("--"):
+                if a.startswith("--in-place") or a == "--separate":
+                    return False
+                continue
+            if a.startswith("-") and len(a) > 1 and "i" in a[1:].split("e")[0].split("f")[0]:
+                return False  # -i, -Ei, -ni, -ri, -i.bak ...
+            if a == "-I" or (a.startswith("-") and "I" in a[1:]):
+                return False
         script = " ".join(a for a in args if not a.startswith("-"))
         return not re.search(r"(^|[;}\s/])w\s", script) and "/w " not in script
+    if prog == "tree":
+        return not any(a == "-o" or a.startswith("-o") for a in args)
+    if prog == "xxd":
+        return len([a for a in args if not a.startswith("-")]) <= 1
+    if prog in ("rg", "ag"):
+        return not any(a == "--pre" or a.startswith("--pre=") for a in args)
     if prog == "find":
         return not any(a in FIND_WRITE for a in args)
     if prog == "fd":

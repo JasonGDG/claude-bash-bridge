@@ -752,6 +752,9 @@ class Store:
         stored = self.keep_blobs(sorted({v[1] for v in pre.values()}), cap)
         files = []
         for st, rel in entry["changes"]:
+            if st in ("B", "U"):  # too large / unreadable: no content was snapshotted
+                files.append({"st": st, "rel": rel, "pre": None, "post": None, "kept": False})
+                continue
             p = pre.get(rel)
             files.append({"st": st, "rel": rel, "pre": list(p) if p else None,
                           "post": list(post[rel]) if rel in post else None,
@@ -826,6 +829,16 @@ class Store:
 
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _user_umask() -> int:
+    """The umask Claude Code / the user's shell had, not the 077 bash-bridge uses for its own state."""
+    from . import util
+    if util.ORIG_UMASK is not None:
+        return util.ORIG_UMASK
+    cur = os.umask(0o022)
+    os.umask(cur)
+    return cur
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
@@ -844,8 +857,9 @@ def _open_parent(store: Store, rel: str, create: bool):
             except FileNotFoundError:
                 if not create:
                     raise
-                os.mkdir(comp, 0o755, dir_fd=fd)
+                os.mkdir(comp, 0o700, dir_fd=fd)
                 nfd = os.open(comp, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=fd)
+                os.fchmod(nfd, 0o777 & ~_user_umask())
             except (NotADirectoryError, OSError) as e:
                 st = os.stat(comp, dir_fd=fd, follow_symlinks=False)
                 import stat as _st
@@ -853,8 +867,9 @@ def _open_parent(store: Store, rel: str, create: bool):
                     raise OSError("refusing to follow the symlink %s in %s" % (comp, rel))
                 if create and _st.S_ISREG(st.st_mode):
                     os.unlink(comp, dir_fd=fd)  # a file now sits where the directory was
-                    os.mkdir(comp, 0o755, dir_fd=fd)
+                    os.mkdir(comp, 0o700, dir_fd=fd)
                     nfd = os.open(comp, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=fd)
+                    os.fchmod(nfd, 0o777 & ~_user_umask())
                 else:
                     raise e
             os.close(fd)
@@ -887,7 +902,7 @@ def write_file(store: Store, rel: str, mode: str, data: bytes) -> None:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600, dir_fd=dfd)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(data)
-                os.fchmod(fh.fileno(), 0o755 if mode == "100755" else 0o644)
+                os.fchmod(fh.fileno(), (0o777 if mode == "100755" else 0o666) & ~_user_umask())
         os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)  # replaces a symlink itself
     finally:
         os.close(dfd)
